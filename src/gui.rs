@@ -49,6 +49,8 @@ enum Operation {
   SetPoints { target: PathBuf, steamid64: u64, value: u32 },
   TransferItems { target: PathBuf, source: PathBuf, steamid64: u64 },
   TransferEquipment { target: PathBuf, source: PathBuf, steamid64: u64 },
+  LoadBox { target: PathBuf, steamid64: u64 },
+  SetItems { target: PathBuf, steamid64: u64, changes: Vec<(u32, u32)> },
 }
 
 impl Operation {
@@ -59,10 +61,12 @@ impl Operation {
       Operation::SetPoints { value, .. } => format!("设置点数为 {value}"),
       Operation::TransferItems { .. } => "转移道具箱".to_owned(),
       Operation::TransferEquipment { .. } => "转移装备(装备箱+护石+组合)".to_owned(),
+      Operation::LoadBox { .. } => "读取道具箱".to_owned(),
+      Operation::SetItems { changes, .. } => format!("修改 {} 项道具数量", changes.len()),
     }
   }
 
-  fn run(self) -> anyhow::Result<String> {
+  fn run(self) -> anyhow::Result<OperationOutcome> {
     match self {
       Operation::Inspect { target, steamid64 } => {
         let document = SteamSave::open_path(&target, steamid64)?;
@@ -87,30 +91,36 @@ impl Operation {
             data.len()
           );
         }
-        Ok(text)
+        Ok((text, None))
       }
       Operation::SetMoney { target, steamid64, value, total_added } => {
         let mut document = SteamSave::open_path(&target, steamid64)?;
         let report = edit::set_money(document.payload_mut(), value, total_added)?;
         let output = write_edited(&mut document, &target, "edited")?;
-        Ok(format!(
-          "金钱已设置: {} -> {} (更新 {} 处)\n输出: {}",
-          report.before.first().copied().unwrap_or(0),
-          value,
-          report.updated,
-          output.display()
+        Ok((
+          format!(
+            "金钱已设置: {} -> {} (更新 {} 处)\n输出: {}",
+            report.before.first().copied().unwrap_or(0),
+            value,
+            report.updated,
+            output.display()
+          ),
+          None,
         ))
       }
       Operation::SetPoints { target, steamid64, value } => {
         let mut document = SteamSave::open_path(&target, steamid64)?;
         let report = edit::set_village_points(document.payload_mut(), value)?;
         let output = write_edited(&mut document, &target, "edited")?;
-        Ok(format!(
-          "点数已设置: {} -> {} (更新 {} 处)\n输出: {}",
-          report.before.first().copied().unwrap_or(0),
-          value,
-          report.updated,
-          output.display()
+        Ok((
+          format!(
+            "点数已设置: {} -> {} (更新 {} 处)\n输出: {}",
+            report.before.first().copied().unwrap_or(0),
+            value,
+            report.updated,
+            output.display()
+          ),
+          None,
         ))
       }
       Operation::TransferItems { target, source, steamid64 } => {
@@ -119,11 +129,14 @@ impl Operation {
         let report =
           edit::transfer_item_box(target_document.payload_mut(), source_document.payload())?;
         let output = write_edited(&mut target_document, &target, "transferred")?;
-        Ok(format!(
-          "道具箱已转移: {} 槽, {} 件道具\n输出: {}",
-          report.slots,
-          report.items,
-          output.display()
+        Ok((
+          format!(
+            "道具箱已转移: {} 槽, {} 件道具\n输出: {}",
+            report.slots,
+            report.items,
+            output.display()
+          ),
+          None,
         ))
       }
       Operation::TransferEquipment { target, source, steamid64 } => {
@@ -138,11 +151,38 @@ impl Operation {
           .map(|(label, fields)| format!("{label}={fields}字段"))
           .collect::<Vec<_>>()
           .join(", ");
-        Ok(format!(
-          "装备已转移: {class_text};装备箱 {} 槽 {} 件\n输出: {}",
-          report.box_slots,
-          report.box_used,
-          output.display()
+        Ok((
+          format!(
+            "装备已转移: {class_text};装备箱 {} 槽 {} 件\n输出: {}",
+            report.box_slots,
+            report.box_used,
+            output.display()
+          ),
+          None,
+        ))
+      }
+      Operation::LoadBox { target, steamid64 } => {
+        let document = SteamSave::open_path(&target, steamid64)?;
+        let entries = edit::read_item_box(document.payload())?;
+        let nonempty = entries.iter().filter(|entry| entry.num > 0).count();
+        let items = entries.into_iter().map(|entry| (entry.id, entry.num)).collect();
+        Ok((format!("道具箱: 读取完成,{} 件非空", nonempty), Some(items)))
+      }
+      Operation::SetItems { target, steamid64, changes } => {
+        let mut document = SteamSave::open_path(&target, steamid64)?;
+        let report = edit::set_item_counts(document.payload_mut(), &changes)?;
+        let output = write_edited(&mut document, &target, "edited")?;
+        let entries = edit::read_item_box(document.payload())?;
+        let items = entries.into_iter().map(|entry| (entry.id, entry.num)).collect();
+        Ok((
+          format!(
+            "道具修改完成: {} 处更新,其中 {} 个新物品填入空槽
+输出: {}",
+            report.applied,
+            report.filled,
+            output.display()
+          ),
+          Some(items),
         ))
       }
     }
@@ -170,8 +210,12 @@ fn derived_output(source: &Path, suffix: &str) -> PathBuf {
   source.with_file_name(name)
 }
 
+/// What a background operation reports: a log line plus, for item box
+/// operations, the resulting item box contents as `(item id, count)` pairs.
+type OperationOutcome = (String, Option<Vec<(u32, u32)>>);
+
 enum WorkerEvent {
-  Finished(String),
+  Finished(OperationOutcome),
 }
 
 #[derive(Default)]
@@ -184,6 +228,10 @@ pub struct GuiApp {
   busy: bool,
   log: String,
   receiver: Option<Receiver<WorkerEvent>>,
+  discovered: Vec<(PathBuf, String)>,
+  box_items: Vec<(u32, u32)>,
+  box_edits: Vec<String>,
+  box_filter: String,
 }
 
 impl GuiApp {
@@ -191,6 +239,15 @@ impl GuiApp {
     let font_status = install_cjk_font(&creation_context.egui_ctx);
     let mut app = Self::default();
     app.log_line(&font_status);
+    app.discovered = discover_steam_slot_files();
+    if app.discovered.is_empty() {
+      app.log_line("自动查找: 未在本机找到 MHR 存档目录,请手动选择存档文件 (见下方帮助)");
+    } else {
+      app.log_line(&format!(
+        "自动查找: 找到 {} 个 MHR 存档目录,可在“快速选择”中选取",
+        app.discovered.len()
+      ));
+    }
     app
   }
 
@@ -206,11 +263,11 @@ impl GuiApp {
     self.log_line(&format!("▶ {}", operation.describe()));
     let context = ctx.clone();
     thread::spawn(move || {
-      let text = match operation.run() {
-        Ok(text) => format!("✔ {text}"),
-        Err(error) => format!("✘ 失败: {error:?}"),
+      let (text, entries) = match operation.run() {
+        Ok((text, entries)) => (format!("✔ {text}"), entries),
+        Err(error) => (format!("✘ 失败: {error:?}"), None),
       };
-      let _ = sender.send(WorkerEvent::Finished(text));
+      let _ = sender.send(WorkerEvent::Finished((text, entries)));
       context.request_repaint();
     });
   }
@@ -218,14 +275,37 @@ impl GuiApp {
   fn parsed_steamid64(&self) -> Result<u64, &'static str> {
     self.steamid64.trim().parse::<u64>().map_err(|_| "SteamID64 必须是纯数字")
   }
+
+  fn pending_item_changes(&self) -> Vec<(u32, u32)> {
+    let mut changes = Vec::new();
+    if self.box_items.is_empty() || self.box_edits.len() != self.box_items.len() {
+      return changes;
+    }
+    for (index, (id, num)) in self.box_items.iter().enumerate() {
+      let text = self.box_edits[index].trim();
+      if text.is_empty() {
+        continue;
+      }
+      if let Ok(new_value) = text.parse::<u32>()
+        && new_value != *num
+      {
+        changes.push((*id, new_value));
+      }
+    }
+    changes
+  }
 }
 
 impl eframe::App for GuiApp {
   fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
     if let Some(receiver) = &self.receiver {
       match receiver.try_recv() {
-        Ok(WorkerEvent::Finished(text)) => {
+        Ok(WorkerEvent::Finished((text, entries))) => {
           self.log_line(&text);
+          if let Some(entries) = entries {
+            self.box_edits = vec![String::new(); entries.len()];
+            self.box_items = entries;
+          }
           self.busy = false;
           self.receiver = None;
         }
@@ -271,6 +351,22 @@ impl eframe::App for GuiApp {
         ui.label("SteamID64");
         ui.add_sized([420.0, 20.0], egui::TextEdit::singleline(&mut self.steamid64));
         ui.label("账号数字 ID");
+        ui.end_row();
+
+        ui.label("快速选择");
+        let selected = self
+          .discovered
+          .iter()
+          .find(|(path, _)| path.display().to_string() == self.target)
+          .map(|(_, label)| label.clone())
+          .unwrap_or_else(|| "(未发现存档)".to_owned());
+        egui::ComboBox::from_id_salt("discovered-saves")
+          .selected_text(selected)
+          .show_ui(ui, |ui| {
+            for (path, label) in &self.discovered {
+              ui.selectable_value(&mut self.target, path.display().to_string(), label);
+            }
+          });
         ui.end_row();
       });
 
@@ -360,6 +456,89 @@ impl eframe::App for GuiApp {
         }
       });
 
+      ui.add_space(6.0);
+      ui.separator();
+      ui.add_space(4.0);
+
+      ui.label("道具箱编辑 (针对目标存档;先“读取道具箱”,再修改数量)");
+      ui.horizontal(|ui| {
+        let steamid = self.parsed_steamid64();
+        let target_ready = !self.busy && steamid.is_ok() && !self.target.trim().is_empty();
+        if ui.add_enabled(target_ready, egui::Button::new("读取道具箱")).clicked() {
+          let operation = Operation::LoadBox {
+            target: PathBuf::from(self.target.trim()),
+            steamid64: steamid.expect("checked"),
+          };
+          self.spawn(ctx, operation);
+        }
+        ui.label("筛选");
+        ui.add_sized([150.0, 20.0], egui::TextEdit::singleline(&mut self.box_filter));
+        let changes = self.pending_item_changes();
+        let apply_text = format!("应用修改 ({})", changes.len());
+        if ui
+          .add_enabled(!self.busy && !changes.is_empty(), egui::Button::new(apply_text))
+          .clicked()
+        {
+          let operation = Operation::SetItems {
+            target: PathBuf::from(self.target.trim()),
+            steamid64: steamid.expect("checked"),
+            changes,
+          };
+          self.spawn(ctx, operation);
+        }
+      });
+      if !self.box_items.is_empty() {
+        let filter = self.box_filter.trim().to_lowercase();
+        let rows: Vec<usize> = (0..self.box_items.len())
+          .filter(|&index| {
+            if filter.is_empty() {
+              return true;
+            }
+            let (id, _) = self.box_items[index];
+            let name = crate::items::item_name(id).unwrap_or("");
+            name.to_lowercase().contains(&filter)
+              || format!("{id:08x}").contains(&filter)
+              || format!("{id}").contains(&filter)
+          })
+          .collect();
+        egui::ScrollArea::vertical()
+          .max_height(240.0)
+          .auto_shrink(false)
+          .show_rows(ui, 20.0, rows.len(), |ui, range| {
+            for row in range {
+              let index = rows[row];
+              let (id, num) = self.box_items[index];
+              ui.horizontal(|ui| {
+                ui.monospace(format!("{id:08x}"));
+                let name = crate::items::item_name(id).unwrap_or("(未知物品)");
+                ui.add_sized([340.0, 18.0], egui::Label::new(name).truncate());
+                ui.add_sized([70.0, 18.0], egui::Label::new(format!("当前 {num}")));
+                if num == 0 {
+                  ui.label("(空)");
+                }
+                ui.add_sized([80.0, 18.0], egui::TextEdit::singleline(&mut self.box_edits[index]));
+              });
+            }
+          });
+        ui.label(format!(
+          "显示 {} / {} 项;“新数量”留空 = 不修改;填 0 = 清空该物品;修改后点“应用修改”",
+          rows.len(),
+          self.box_items.len()
+        ));
+      }
+
+      ui.add_space(6.0);
+      egui::CollapsingHeader::new("存档在哪里?加载什么文件?")
+        .default_open(false)
+        .show(ui, |ui| {
+          ui.label(r"存档目录: <Steam库>\userdata\<32位账号ID>\1446780\remote\win64_save");
+          ui.label(r"· Steam 默认装在 C:\Program Files (x86)\Steam;自定义库在其它盘(例如 D:\Steam)。启动时已自动扫描所有 Steam 库。");
+          ui.label("· 角色存档: data001Slot.bin ~ data003Slot.bin(游戏内最多 3 个角色槽,即读档界面的 3 个存档位)");
+          ui.label("· 系统存档: data00-1.bin(全局数据,一般不需要修改);SS1_* / SS4_* / SS7_* 是相册数据");
+          ui.label("· 推荐流程: backup 备份 → 生成新文件 → 关闭游戏 → 用输出文件替换原存档 → 进游戏确认");
+          ui.label("· Steam 云同步: 编辑时建议让 Steam 离线,避免云端旧档覆盖");
+        });
+
       ui.add_space(8.0);
       ui.separator();
       ui.label("运行日志");
@@ -372,4 +551,90 @@ impl eframe::App for GuiApp {
       ctx.request_repaint_after(Duration::from_millis(120));
     }
   }
+}
+
+/// Scans every known Steam library for MHR save directories
+/// (`userdata/<account>/1446780/remote/win64_save`).
+fn discover_save_dirs() -> Vec<PathBuf> {
+  let mut roots: Vec<PathBuf> = Vec::new();
+  if let Ok(output) = std::process::Command::new("reg")
+    .args(["query", r"HKCU\Software\Valve\Steam", "/v", "SteamPath"])
+    .output()
+  {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+      if let Some(position) = line.find("REG_SZ") {
+        let value = line[position + "REG_SZ".len()..].trim();
+        if !value.is_empty() {
+          roots.push(PathBuf::from(value));
+        }
+      }
+    }
+  }
+  roots.push(PathBuf::from(r"C:\Program Files (x86)\Steam"));
+  roots.push(PathBuf::from(r"D:\Steam"));
+  roots.push(PathBuf::from(r"E:\Steam"));
+  roots.sort();
+  roots.dedup();
+
+  let mut libraries = roots.clone();
+  for root in &roots {
+    let vdf = root.join("steamapps").join("libraryfolders.vdf");
+    let Ok(text) = fs::read_to_string(&vdf) else {
+      continue;
+    };
+    for line in text.lines() {
+      let trimmed = line.trim();
+      if !trimmed.starts_with("\"path\"") {
+        continue;
+      }
+      let parts: Vec<&str> = trimmed.split('"').collect();
+      if parts.len() >= 4 {
+        let raw = parts[parts.len() - 2];
+        if !raw.is_empty() {
+          libraries.push(PathBuf::from(raw.replace("\\\\", "\\")));
+        }
+      }
+    }
+  }
+  libraries.sort();
+  libraries.dedup();
+
+  let mut saves = Vec::new();
+  for library in &libraries {
+    let userdata = library.join("userdata");
+    let Ok(accounts) = fs::read_dir(&userdata) else {
+      continue;
+    };
+    for account in accounts.flatten() {
+      let dir = account.path().join("1446780").join("remote").join("win64_save");
+      if dir.is_dir() {
+        saves.push(dir);
+      }
+    }
+  }
+  saves.sort();
+  saves.dedup();
+  saves
+}
+
+/// Lists the character slot files inside a discovered save directory.
+fn discover_steam_slot_files() -> Vec<(PathBuf, String)> {
+  let mut files = Vec::new();
+  for dir in discover_save_dirs() {
+    for name in ["data001Slot.bin", "data002Slot.bin", "data003Slot.bin"] {
+      let path = dir.join(name);
+      if path.is_file() {
+        let account = dir
+          .parent()
+          .and_then(|remote| remote.parent())
+          .and_then(|appid| appid.parent())
+          .and_then(|account| account.file_name())
+          .map(|name| name.to_string_lossy().to_string())
+          .unwrap_or_default();
+        files.push((path, format!("账号 {account} / {name}")));
+      }
+    }
+  }
+  files
 }

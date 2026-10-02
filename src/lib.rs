@@ -14,5 +14,6 @@ pub mod discover;
 pub mod edit;
 pub mod format;
 pub mod gui;
+pub mod items;
 pub mod json;
 pub mod payload;

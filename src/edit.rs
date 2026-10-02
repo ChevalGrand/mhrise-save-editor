@@ -27,6 +27,11 @@ pub const ITEM_BOX_INVENTORY_LIST: u32 = 0x7996_e7ee;
 pub const ITEM_INVENTORY_COUNT: u32 = 0xc2b3_951c;
 /// `snow.data.ItemCount._Num`
 pub const ITEM_COUNT_NUM: u32 = 0x8c11_a916;
+/// `snow.data.ItemCount._Id`
+pub const ITEM_COUNT_ID: u32 = 0xaf48_5d0f;
+/// `snow.data.ContentsIdSystem.ItemId.I_Unclassified_None` — the sentinel id
+/// the game writes into empty item box slots (`_Num == 0`).
+pub const ITEM_ID_NONE: u32 = 0x0400_0000;
 /// `snow.data.EquipBox` — weapon/armor/talisman storage.
 pub const EQUIP_BOX_CLASS: u32 = 0xf050_9899;
 /// `snow.data.EquipDataManager.SaveData1` — worn pack, loadouts, hunter sets.
@@ -334,6 +339,179 @@ fn count_nonempty_slots(array: &Array) -> usize {
     .count()
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ItemBoxEntry {
+  pub id: u32,
+  pub num: u32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ItemEditReport {
+  /// Number of requested changes that found a slot.
+  pub applied: usize,
+  /// Number of previously empty slots filled with a new item.
+  pub filled: usize,
+}
+
+/// Reads the item box as `(item id, count)` pairs in slot order. Empty slots
+/// have `num == 0`.
+pub fn read_item_box(payload: &SavePayload) -> Result<Vec<ItemBoxEntry>> {
+  let array = find_inventory_list(payload)?;
+  let mut entries = Vec::with_capacity(array.values.len());
+  for element in &array.values {
+    let ArrayValue::Class(slot) = element else {
+      continue;
+    };
+    let mut id = 0;
+    let mut num = 0;
+    for slot_field in &slot.fields {
+      if slot_field.hash != ITEM_INVENTORY_COUNT {
+        continue;
+      }
+      let FieldValue::Class(count) = &slot_field.value else {
+        continue;
+      };
+      for field in &count.fields {
+        let FieldValue::Scalar { size, bytes } = &field.value else {
+          continue;
+        };
+        if *size != 4 || bytes.len() != 4 {
+          continue;
+        }
+        let value = u32::from_le_bytes(bytes.as_slice().try_into().expect("4 bytes"));
+        if field.hash == ITEM_COUNT_ID {
+          id = value;
+        } else if field.hash == ITEM_COUNT_NUM {
+          num = value;
+        }
+      }
+    }
+    entries.push(ItemBoxEntry { id, num });
+  }
+  Ok(entries)
+}
+
+/// Applies per-item count changes to the item box: a slot carrying the item's
+/// id is updated in place; items not yet in the box fill empty (`num == 0`)
+/// slots. Setting a count to 0 empties the item's slot.
+pub fn set_item_counts(
+  payload: &mut SavePayload,
+  changes: &[(u32, u32)],
+) -> Result<ItemEditReport> {
+  let mut pending: std::collections::BTreeMap<u32, u32> = changes.iter().copied().collect();
+  let mut report = ItemEditReport { applied: 0, filled: 0 };
+
+  // Pass 1: update slots whose id matches a pending change. Clearing (0)
+  // also restores the "none" sentinel so the slot matches the game's own
+  // empty-slot representation.
+  for_each_item_count_mut(payload, &mut |count| {
+    let id = read_count_field(count, ITEM_COUNT_ID);
+    if let Some(number) = pending.get(&id).copied() {
+      if number == 0 {
+        write_count_field(count, ITEM_COUNT_ID, ITEM_ID_NONE);
+      }
+      write_count_field(count, ITEM_COUNT_NUM, number);
+      pending.remove(&id);
+      report.applied += 1;
+    }
+  });
+
+  // Pass 2: place remaining new items into empty slots (`_Num == 0`).
+  if !pending.is_empty() {
+    let mut fill_order: Vec<u32> =
+      pending.iter().filter(|(_, num)| **num > 0).map(|(id, _)| *id).collect();
+    fill_order.sort_unstable();
+    let mut fill_iter = fill_order.into_iter();
+    let mut next_fill = fill_iter.next();
+    for_each_item_count_mut(payload, &mut |count| {
+      let Some(id) = next_fill else { return };
+      let Some(number) = pending.get(&id).copied() else { return };
+      if read_count_field(count, ITEM_COUNT_NUM) == 0 {
+        write_count_field(count, ITEM_COUNT_ID, id);
+        write_count_field(count, ITEM_COUNT_NUM, number);
+        pending.remove(&id);
+        next_fill = fill_iter.next();
+        report.applied += 1;
+        report.filled += 1;
+      }
+    });
+  }
+
+  let unplaced: Vec<u32> = pending.iter().filter(|(_, num)| **num > 0).map(|(id, _)| *id).collect();
+  if !unplaced.is_empty() {
+    bail!(
+      "item box is full: {} new item(s) could not be placed (ids: {:08x?})",
+      unplaced.len(),
+      unplaced
+    );
+  }
+  Ok(report)
+}
+
+/// Walks every `snow.data.ItemCount` class inside the item box.
+fn for_each_item_count_mut(payload: &mut SavePayload, f: &mut dyn FnMut(&mut Class)) {
+  for entry in &mut payload.entries {
+    for_each_item_count_in_class(&mut entry.class, f);
+  }
+}
+
+fn for_each_item_count_in_class(class: &mut Class, f: &mut dyn FnMut(&mut Class)) {
+  let class_hash = class.hash;
+  for field in &mut class.fields {
+    if class_hash == ITEM_BOX_CLASS
+      && field.hash == ITEM_BOX_INVENTORY_LIST
+      && let FieldValue::Array(array) = &mut field.value
+    {
+      for element in &mut array.values {
+        if let ArrayValue::Class(slot) = element {
+          for slot_field in &mut slot.fields {
+            if slot_field.hash == ITEM_INVENTORY_COUNT
+              && let FieldValue::Class(count) = &mut slot_field.value
+            {
+              f(count);
+            }
+          }
+        }
+      }
+    }
+    match &mut field.value {
+      FieldValue::Class(nested) => for_each_item_count_in_class(nested, f),
+      FieldValue::Array(array) => {
+        for element in &mut array.values {
+          if let ArrayValue::Class(nested) = element {
+            for_each_item_count_in_class(nested, f);
+          }
+        }
+      }
+      _ => {}
+    }
+  }
+}
+
+fn read_count_field(count: &Class, field_hash: u32) -> u32 {
+  for field in &count.fields {
+    if field.hash == field_hash
+      && let FieldValue::Scalar { size: 4, bytes } = &field.value
+      && bytes.len() == 4
+    {
+      return u32::from_le_bytes(bytes.as_slice().try_into().expect("4 bytes"));
+    }
+  }
+  0
+}
+
+fn write_count_field(count: &mut Class, field_hash: u32, value: u32) {
+  for field in &mut count.fields {
+    if field.hash == field_hash
+      && let FieldValue::Scalar { size: 4, bytes } = &mut field.value
+      && bytes.len() == 4
+    {
+      *bytes = value.to_le_bytes().to_vec();
+      return;
+    }
+  }
+}
+
 /// Rewrites every u32 scalar at `class_hash` + `field_hash` to `value`,
 /// returning the previous values. Refuses to write nothing: a zero match
 /// means the assumed schema drifted and an edit would be a silent no-op.
@@ -627,5 +805,45 @@ mod tests {
     let mut target = SavePayload { entries: vec![] };
     let error = copy_class_fields(&mut target, &source, EQUIP_BOX_CLASS).expect_err("must fail");
     assert!(error.to_string().contains("target contains 0"), "unexpected error: {error}");
+  }
+
+  #[test]
+  fn reads_and_edits_item_box_counts() {
+    let mut payload = box_payload(vec![
+      item_slot(0x0410_0006, 10),
+      item_slot(0x0410_0007, 20),
+      item_slot(ITEM_ID_NONE, 0),
+    ]);
+    let entries = read_item_box(&payload).expect("read box");
+    assert_eq!(
+      entries,
+      vec![
+        ItemBoxEntry { id: 0x0410_0006, num: 10 },
+        ItemBoxEntry { id: 0x0410_0007, num: 20 },
+        ItemBoxEntry { id: ITEM_ID_NONE, num: 0 },
+      ]
+    );
+
+    // Edit an existing stack, clear another, and add a new item.
+    let report =
+      set_item_counts(&mut payload, &[(0x0410_0006, 99), (0x0410_0007, 0), (0x0410_0100, 5)])
+        .expect("set counts");
+    assert_eq!(report.applied, 3);
+    assert_eq!(report.filled, 1);
+
+    let entries = read_item_box(&payload).expect("read box");
+    assert_eq!(entries[0], ItemBoxEntry { id: 0x0410_0006, num: 99 });
+    // The new item filled the first empty slot (the one just cleared).
+    assert_eq!(entries[1], ItemBoxEntry { id: 0x0410_0100, num: 5 });
+    // The remaining slot stays in the game's empty representation.
+    assert_eq!(entries[2], ItemBoxEntry { id: ITEM_ID_NONE, num: 0 });
+  }
+
+  #[test]
+  fn set_item_counts_refuses_when_box_has_no_room() {
+    let mut payload = box_payload(vec![item_slot(0x0410_0006, 10)]);
+    let error =
+      set_item_counts(&mut payload, &[(0x0410_0200, 1)]).expect_err("no empty slot must fail");
+    assert!(error.to_string().contains("full"), "unexpected error: {error}");
   }
 }
