@@ -673,8 +673,11 @@ impl GuiApp {
     };
     ui.horizontal(|ui| {
       ui.monospace(format!("{id:08x}"));
-      let name = crate::items::item_name(id).unwrap_or("(未知物品)");
-      ui.add_sized([320.0, 18.0], egui::Label::new(name).truncate());
+      let name = crate::items::item_display_name(id);
+      ui.add_sized([220.0, 18.0], egui::Label::new(name).truncate());
+      if let Some(category) = crate::items::item_category(id) {
+        ui.add_sized([80.0, 18.0], egui::Label::new(egui::RichText::new(category).weak()).truncate());
+      }
       ui.add_sized([80.0, 18.0], egui::Label::new(format!("当前 {num}")));
       if num == 0 {
         ui.label("(空)");
@@ -796,8 +799,10 @@ impl GuiApp {
           return true;
         }
         let (id, _) = opened.box_items[index];
-        let name = crate::items::item_name(id).unwrap_or("");
-        name.to_lowercase().contains(filter)
+        let category = crate::items::item_category(id).unwrap_or("");
+        crate::items::item_name_cn(id).unwrap_or("").contains(filter)
+          || category.to_lowercase().contains(filter)
+          || crate::items::item_name(id).unwrap_or("").to_lowercase().contains(filter)
           || format!("{id:08x}").contains(filter)
           || format!("{id}").contains(filter)
       })

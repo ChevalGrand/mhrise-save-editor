@@ -1,4 +1,7 @@
 /target
 /dist
 /assets/mhrise/*.json
+# Name tables are embedded via include_str!; fresh clones must compile.
+!/assets/mhrise/item_names.json
+!/assets/mhrise/item_names_cn.json
 __pycache__/

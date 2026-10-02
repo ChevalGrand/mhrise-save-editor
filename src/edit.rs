@@ -203,8 +203,8 @@ pub fn set_money(
   Ok(report)
 }
 
-/// `snow.data.MyData._HunterName` — the hunter's display name.
-pub const HUNTER_NAME_FIELD: u32 = 0xf79f_3af6;
+/// `snow.data.MyData.HunterName` — the hunter's display name.
+pub const HUNTER_NAME_FIELD: u32 = 0x02bb_0110;
 
 /// Reads a u32 scalar from the first class instance matching `class_hash` +
 /// `field_hash`.
@@ -233,7 +233,9 @@ pub fn read_points(payload: &SavePayload) -> Option<u32> {
   read_scalar(payload, VILLAGE_POINT_CLASS, VILLAGE_POINT_VALUE)
 }
 
-/// Reads the hunter's display name from `MyData._HunterName`.
+/// Reads the hunter's display name (`snow.data.ProfileData.HunterName`).
+/// Buddy lists reuse the same field for buddy names, so the first match in
+/// document order — the hunter's own profile — is returned.
 pub fn read_hunter_name(payload: &SavePayload) -> Option<String> {
   fn walk(class: &Class, out: &mut Option<String>) {
     if out.is_some() {
@@ -877,6 +879,42 @@ mod tests {
     let mut target = SavePayload { entries: vec![] };
     let error = copy_class_fields(&mut target, &source, EQUIP_BOX_CLASS).expect_err("must fail");
     assert!(error.to_string().contains("target contains 0"), "unexpected error: {error}");
+  }
+
+  fn name_entry(native_hash: u32, name: &str) -> crate::payload::NativeClass {
+    let profile = Class {
+      hash: 0x4454_1321, // snow.data.ProfileData
+      fields: vec![Field {
+        hash: HUNTER_NAME_FIELD,
+        field_type: 0x0f,
+        value: FieldValue::String(name.encode_utf16().collect()),
+      }],
+    };
+    crate::payload::NativeClass {
+      native_hash,
+      class: Class {
+        hash: 0x2,
+        fields: vec![Field {
+          hash: 0x3,
+          field_type: 0x11,
+          value: FieldValue::Class(Box::new(profile)),
+        }],
+      },
+    }
+  }
+
+  #[test]
+  fn reads_hunter_name_from_the_first_profile() {
+    // The save carries the hunter profile before buddy lists, which reuse the
+    // same name field for buddy names; document order must win.
+    let payload = SavePayload {
+      entries: vec![
+        name_entry(0x10, "原初形态爵银龙"),
+        name_entry(0x20, "积极boy"),
+      ],
+    };
+    assert_eq!(read_hunter_name(&payload).as_deref(), Some("原初形态爵银龙"));
+    assert_eq!(read_hunter_name(&SavePayload { entries: vec![] }), None);
   }
 
   #[test]
