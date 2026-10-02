@@ -3,7 +3,15 @@
 A Steam-only tool for inspecting, dumping, editing, and repacking *Monster Hunter Rise* (Steam / `win64_save`) save files. Built for editing in-save values (items, counts, and similar) and for transferring data between the three save slots (`data001Slot.bin` … `data003Slot.bin`).
 
 > [!WARNING]
-> **Status:** foundation phase (phase 1). The tool can open Steam saves, dump the full save payload tree to JSON, load an edited JSON back, and repack a save. No gameplay schema yet: it does not know which field is "money" or "item box" — that mapping arrives in the next phase. Always back up your saves and edit with the game closed.
+> Always back up your saves (`backup` command) and edit with the game closed. Field mappings were verified against real saves (wallet, points, item box, equipment); unusual edits may still behave unexpectedly — test on a throwaway slot first.
+
+## GUI
+
+```bash
+cargo run --release --bin mhrise-save-editor-gui
+```
+
+Pick a target save, optionally a source save (for transfers), enter your SteamID64, and use the buttons to read save info, set wallet/points, transfer the item box, or transfer the whole equipment complex (equipment box + talismans + loadout registers + worn pack). Every operation runs in the background and writes a NEW file (`<name>.edited.bin` / `<name>.transferred.bin`) next to the chosen save; swap it in with the game closed.
 
 ## Attribution
 

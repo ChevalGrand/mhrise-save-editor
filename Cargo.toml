@@ -8,6 +8,7 @@ license = "MIT"
 readme = "README.md"
 keywords = ["monster-hunter-rise", "save-editor", "steam"]
 categories = ["command-line-utilities"]
+default-run = "mhrise-save-editor"
 
 [dependencies]
 anyhow = "1.0"
@@ -15,11 +16,13 @@ aes = "0.9"
 bitflags = "2.9"
 cbc = "0.2"
 clap = { version = "4.5", features = ["derive"] }
+eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 hex-literal = "1.0"
 murmur3 = "0.5"
 num-bigint = "0.4"
 num-integer = "0.1"
 rand = "0.10"
+rfd = "0.15"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha3 = "0.11"
