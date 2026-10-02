@@ -1,0 +1,13 @@
+[source.crates-io]
+replace-with = 'rsproxy-sparse'
+
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+
+# The machine-wide git config points at a local proxy (127.0.0.1:7890) that is
+# not always running; cargo inherits it. Empty string disables the proxy.
+[http]
+proxy = ""
+
+[net]
+git-fetch-with-cli = true
