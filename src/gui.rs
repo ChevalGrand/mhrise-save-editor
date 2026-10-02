@@ -29,14 +29,24 @@ pub fn run() -> eframe::Result<()> {
     "MHRise Save Editor",
     options,
     Box::new(|creation_context| {
-      install_cjk_font(&creation_context.egui_ctx);
-      Ok(Box::new(GuiApp::default()))
+      let font_status = install_cjk_font(&creation_context.egui_ctx);
+      let mut app = GuiApp::default();
+      app.log_line(&font_status);
+      Ok(Box::new(app))
     }),
   )
 }
 
-fn install_cjk_font(ctx: &egui::Context) {
-  for path in ["C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/simsun.ttc"] {
+/// Loads a single-face CJK .ttf font. egui's text rasterizer (ab_glyph) does
+/// NOT support .ttc collections, which is why msyh.ttc/simsun.ttc cannot be
+/// used directly. Returns a status line for the on-screen log.
+fn install_cjk_font(ctx: &egui::Context) -> String {
+  for (path, label) in [
+    ("C:/Windows/Fonts/Deng.ttf", "等线 (Deng.ttf)"),
+    ("C:/Windows/Fonts/simhei.ttf", "黑体 (simhei.ttf)"),
+    ("C:/Windows/Fonts/Dengb.ttf", "等线粗体 (Dengb.ttf)"),
+    ("C:/Windows/Fonts/STXIHEI.TTF", "华文细黑 (STXIHEI.TTF)"),
+  ] {
     let Ok(bytes) = fs::read(path) else {
       continue;
     };
@@ -46,8 +56,9 @@ fn install_cjk_font(ctx: &egui::Context) {
       fonts.families.entry(family).or_default().insert(0, "cjk".to_owned());
     }
     ctx.set_fonts(fonts);
-    return;
+    return format!("字体: 已加载 {label}");
   }
+  "字体: 未找到系统中文字体,中文将显示为方框".to_owned()
 }
 
 #[derive(Debug)]
