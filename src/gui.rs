@@ -18,25 +18,6 @@ use egui::Grid;
 
 use crate::{container::SteamSave, discover::discover_save_files, edit, format::parse_header};
 
-/// Starts the GUI, loading a CJK-capable system font when available so that
-/// Chinese labels render instead of tofu boxes.
-pub fn run() -> eframe::Result<()> {
-  let options = eframe::NativeOptions {
-    viewport: egui::ViewportBuilder::default().with_inner_size([820.0, 660.0]),
-    ..Default::default()
-  };
-  eframe::run_native(
-    "MHRise Save Editor",
-    options,
-    Box::new(|creation_context| {
-      let font_status = install_cjk_font(&creation_context.egui_ctx);
-      let mut app = GuiApp::default();
-      app.log_line(&font_status);
-      Ok(Box::new(app))
-    }),
-  )
-}
-
 /// Loads a single-face CJK .ttf font. egui's text rasterizer (ab_glyph) does
 /// NOT support .ttc collections, which is why msyh.ttc/simsun.ttc cannot be
 /// used directly. Returns a status line for the on-screen log.
@@ -206,8 +187,11 @@ pub struct GuiApp {
 }
 
 impl GuiApp {
-  pub fn new(_creation_context: &eframe::CreationContext) -> Self {
-    Self::default()
+  pub fn new(creation_context: &eframe::CreationContext) -> Self {
+    let font_status = install_cjk_font(&creation_context.egui_ctx);
+    let mut app = Self::default();
+    app.log_line(&font_status);
+    app
   }
 
   fn log_line(&mut self, text: &str) {
