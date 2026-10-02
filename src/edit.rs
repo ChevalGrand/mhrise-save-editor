@@ -203,6 +203,78 @@ pub fn set_money(
   Ok(report)
 }
 
+/// `snow.data.MyData._HunterName` — the hunter's display name.
+pub const HUNTER_NAME_FIELD: u32 = 0xf79f_3af6;
+
+/// Reads a u32 scalar from the first class instance matching `class_hash` +
+/// `field_hash`.
+pub fn read_scalar(payload: &SavePayload, class_hash: u32, field_hash: u32) -> Option<u32> {
+  let mut classes = Vec::new();
+  collect_classes(payload, class_hash, &mut classes);
+  let class = classes.first()?;
+  class.fields.iter().find(|field| field.hash == field_hash).and_then(|field| match &field.value {
+    FieldValue::Scalar { size: 4, bytes } if bytes.len() == 4 => {
+      Some(u32::from_le_bytes(bytes.as_slice().try_into().expect("4 bytes")))
+    }
+    _ => None,
+  })
+}
+
+/// Reads the current wallet amount and the lifetime money-gained counter.
+pub fn read_money(payload: &SavePayload) -> Option<(u32, u32)> {
+  Some((
+    read_scalar(payload, HAND_MONEY_CLASS, HAND_MONEY_VALUE)?,
+    read_scalar(payload, HAND_MONEY_CLASS, HAND_MONEY_TOTAL_ADDED)?,
+  ))
+}
+
+/// Reads the current Kamura/Steady point balance.
+pub fn read_points(payload: &SavePayload) -> Option<u32> {
+  read_scalar(payload, VILLAGE_POINT_CLASS, VILLAGE_POINT_VALUE)
+}
+
+/// Reads the hunter's display name from `MyData._HunterName`.
+pub fn read_hunter_name(payload: &SavePayload) -> Option<String> {
+  fn walk(class: &Class, out: &mut Option<String>) {
+    if out.is_some() {
+      return;
+    }
+    for field in &class.fields {
+      if field.hash == HUNTER_NAME_FIELD
+        && let FieldValue::String(units) = &field.value
+      {
+        *out = Some(String::from_utf16_lossy(units));
+        return;
+      }
+      match &field.value {
+        FieldValue::Class(nested) => walk(nested, out),
+        FieldValue::Array(array) => {
+          for element in &array.values {
+            if let ArrayValue::Class(nested) = element {
+              walk(nested, out);
+              if out.is_some() {
+                return;
+              }
+            }
+          }
+        }
+        _ => {}
+      }
+      if out.is_some() {
+        return;
+      }
+    }
+  }
+  let mut out = None;
+  for entry in &payload.entries {
+    walk(&entry.class, &mut out);
+    if out.is_some() {
+      break;
+    }
+  }
+  out
+}
+
 /// Sets the current Kamura/Steady point balance.
 pub fn set_village_points(payload: &mut SavePayload, value: u32) -> Result<EditReport> {
   set_scalar(payload, VILLAGE_POINT_CLASS, VILLAGE_POINT_VALUE, value, "_Point")
