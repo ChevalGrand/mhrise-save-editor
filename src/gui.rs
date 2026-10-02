@@ -90,11 +90,12 @@ pub struct GuiApp {
   target_path: String,
   source_path: String,
   steamid64: String,
-  discovered: Vec<(PathBuf, String)>,
+  discovered: Vec<(PathBuf, String, Option<u32>)>,
   target: Option<Box<OpenedSave>>,
   source: Option<Box<OpenedSave>>,
   dirty: bool,
   reopen_clicked_once: bool,
+  status_error: Option<String>,
   money_input: String,
   points_input: String,
   total_input: String,
@@ -113,6 +114,9 @@ impl GuiApp {
     let mut app = Self::default();
     app.log_line(&font_status);
     app.discovered = discover_steam_slot_files();
+    if let Some((_, _, Some(account))) = app.discovered.first() {
+      app.steamid64 = steamid64_from_account(*account).to_string();
+    }
     if app.discovered.is_empty() {
       app.log_line("自动查找: 未在本机找到 MHR 存档目录,请手动选择存档文件 (见“帮助”页)");
     } else {
@@ -345,6 +349,23 @@ impl eframe::App for GuiApp {
         Ok(WorkerEvent::Opened(result, is_source)) => {
           self.busy = false;
           self.receiver = None;
+          if let Err(error) = &result {
+            self.status_error = Some(error.clone());
+            // A wrong SteamID64 is the common failure; the save path names the
+            // 32-bit account id, so derive the correct value automatically.
+            let failed_path = if is_source { &self.source_path } else { &self.target_path };
+            if let Some(account) = account_id_from_path(Path::new(failed_path.trim()))
+              && self.steamid64.trim() != steamid64_from_account(account).to_string()
+            {
+              self.steamid64 = steamid64_from_account(account).to_string();
+              self.log_line(&format!(
+                "⚠ 已根据存档路径把 SteamID64 自动修正为 {},请重试",
+                self.steamid64
+              ));
+            }
+          } else {
+            self.status_error = None;
+          }
           match result {
             Ok(opened) => {
               let (money, total) = edit::read_money(opened.document.payload()).unwrap_or((0, 0));
@@ -431,12 +452,24 @@ impl GuiApp {
       let selected = self
         .discovered
         .iter()
-        .find(|(path, _)| path.display().to_string() == self.target_path)
-        .map(|(_, label)| label.clone())
+        .find(|(path, _, _)| path.display().to_string() == self.target_path)
+        .map(|(_, label, _)| label.clone())
         .unwrap_or_else(|| "(未发现存档)".to_owned());
       egui::ComboBox::from_id_salt("discovered-saves").selected_text(selected).show_ui(ui, |ui| {
-        for (path, label) in &self.discovered {
-          ui.selectable_value(&mut self.target_path, path.display().to_string(), label);
+        for (path, label, account) in &self.discovered {
+          if ui.selectable_value(&mut self.target_path, path.display().to_string(), label).clicked()
+            && let Some(account) = account
+          {
+            // The save folder name is the 32-bit account id; derive the
+            // SteamID64 automatically so users never have to look it up.
+            self.steamid64 = steamid64_from_account(*account).to_string();
+            let note = format!(
+              "已根据存档路径自动填入 SteamID64: {}
+",
+              self.steamid64
+            );
+            self.log.push_str(&note);
+          }
         }
       });
       ui.label("SteamID64");
@@ -481,6 +514,9 @@ impl GuiApp {
       }
       ui.end_row();
     });
+    if let Some(error) = &self.status_error {
+      ui.colored_label(egui::Color32::LIGHT_RED, format!("✘ 上次操作失败: {error}"));
+    }
     ui.label(match (&self.target, self.busy) {
       (_, true) => format!("⏳ {}…", self.busy_text),
       (Some(opened), _) => format!(
@@ -846,7 +882,7 @@ fn discover_save_dirs() -> Vec<PathBuf> {
 }
 
 /// Lists the character slot files inside every discovered save directory.
-fn discover_steam_slot_files() -> Vec<(PathBuf, String)> {
+fn discover_steam_slot_files() -> Vec<(PathBuf, String, Option<u32>)> {
   let mut files = Vec::new();
   let mut seen = std::collections::BTreeSet::new();
   for dir in discover_save_dirs() {
@@ -861,7 +897,7 @@ fn discover_steam_slot_files() -> Vec<(PathBuf, String)> {
           .and_then(|account| account.file_name())
           .map(|name| name.to_string_lossy().to_string())
           .unwrap_or_default();
-        files.push((path, format!("账号 {account} / {name}")));
+        files.push((path, format!("账号 {account} / {name}"), account.parse::<u32>().ok()));
       }
     }
   }
@@ -874,4 +910,24 @@ fn derived_output(source: &Path, suffix: &str) -> PathBuf {
   name.push_str(suffix);
   name.push_str(".bin");
   source.with_file_name(name)
+}
+
+/// `userdata\<account>\1446780\...`: the component right after `userdata`
+/// (one step before it in the ancestor walk) is the 32-bit account id.
+fn account_id_from_path(path: &Path) -> Option<u32> {
+  let ancestors: Vec<&Path> = path.ancestors().collect();
+  for (index, ancestor) in ancestors.iter().enumerate() {
+    if index > 0
+      && let Some(name) = ancestor.file_name()
+      && name.to_str()?.eq_ignore_ascii_case("userdata")
+    {
+      return ancestors[index - 1].file_name()?.to_str()?.parse::<u32>().ok();
+    }
+  }
+  None
+}
+
+/// SteamID64 = 76561197960265728 + 32-bit account id.
+fn steamid64_from_account(account: u32) -> u64 {
+  76_561_197_960_265_728 + u64::from(account)
 }
