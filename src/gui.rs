@@ -80,7 +80,9 @@ impl OpenedSave {
 
 enum WorkerEvent {
   Opened(Result<Box<OpenedSave>, String>, bool),
-  Saved(Result<PathBuf, String>),
+  /// Wrote the document; the second element is the automatic backup location
+  /// for in-place saves.
+  Saved(Result<(PathBuf, Option<PathBuf>), String>),
   /// A background operation that only produces a status line (backup/restore).
   Report(Result<String, String>),
 }
@@ -436,6 +438,24 @@ impl GuiApp {
     });
     self.spawn(ui.ctx(), WorkerTask::Save { document: snapshot, output });
   }
+
+  /// Writes the opened save back to its original path, taking a fresh
+  /// directory backup first so the write is always reversible.
+  fn save_target_in_place(&mut self, ui: &egui::Ui) {
+    let Some(opened) = self.target.as_ref() else {
+      return;
+    };
+    let Some(backup_dir) = opened.path.parent().map(Path::to_path_buf) else {
+      return;
+    };
+    let snapshot = Box::new(OpenedSave {
+      path: opened.path.clone(),
+      document: opened.document.clone(),
+      hunter_name: opened.hunter_name.clone(),
+      box_items: opened.box_items.clone(),
+    });
+    self.spawn(ui.ctx(), WorkerTask::SaveInPlace { document: snapshot, backup_dir });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -445,6 +465,9 @@ impl GuiApp {
 enum WorkerTask {
   Open { path: PathBuf, steamid64: u64, is_source: bool },
   Save { document: Box<OpenedSave>, output: PathBuf },
+  /// Writes over the original save path, after a fresh backup of its
+  /// directory; the write is skipped when the backup fails.
+  SaveInPlace { document: Box<OpenedSave>, backup_dir: PathBuf },
   Backup { dir: PathBuf },
   Restore { backup: PathBuf, target_dir: PathBuf },
 }
@@ -460,6 +483,9 @@ impl WorkerTask {
         }
       }
       WorkerTask::Save { output, .. } => format!("保存到: {}", output.display()),
+      WorkerTask::SaveInPlace { backup_dir, .. } => {
+        format!("写入原存档 (先备份 {})", backup_dir.display())
+      }
       WorkerTask::Backup { dir } => format!("备份目录: {}", dir.display()),
       WorkerTask::Restore { backup, target_dir } => {
         format!("还原 {} 到 {}", backup.display(), target_dir.display())
@@ -476,7 +502,18 @@ impl WorkerTask {
       }
       WorkerTask::Save { document, output } => {
         let result =
-          document.document.write_to(&output).map(|_| output).map_err(|error| format!("{error:?}"));
+          document.document.write_to(&output).map(|_| (output, None)).map_err(|error| format!("{error:?}"));
+        WorkerEvent::Saved(result)
+      }
+      WorkerTask::SaveInPlace { document, backup_dir } => {
+        let run = || -> anyhow::Result<(PathBuf, Option<PathBuf>)> {
+          let report = crate::archive::backup_dir(&backup_dir, None)?;
+          let backup = report.destination.clone();
+          let output = document.path.clone();
+          document.document.write_to(&output)?;
+          Ok((output, Some(backup)))
+        };
+        let result = run().map_err(|error| format!("{error:?}"));
         WorkerEvent::Saved(result)
       }
       WorkerTask::Backup { dir } => {
@@ -604,9 +641,15 @@ impl eframe::App for GuiApp {
           self.busy = false;
           self.receiver = None;
           match result {
-            Ok(output) => {
+            Ok((output, backup)) => {
               self.dirty = false;
-              self.log_line(&format!("✔ 已保存: {}", output.display()));
+              self.log_line(&format!(
+                "✔ 已写入: {}{}",
+                output.display(),
+                backup
+                  .map(|backup| format!(" (已自动备份到 {})", backup.display()))
+                  .unwrap_or_default()
+              ));
             }
             Err(error) => self.log_line(&format!("✘ 保存失败: {error}")),
           }
@@ -890,10 +933,10 @@ impl GuiApp {
         }
       }
       if ui
-        .add_enabled(!self.busy && self.target.is_some(), egui::Button::new("保存为新文件"))
+        .add_enabled(!self.busy && self.target.is_some(), egui::Button::new("写入原存档 (先自动备份)"))
         .clicked()
       {
-        self.save_target_to_new_file(ui);
+        self.save_target_in_place(ui);
       }
       ui.label("(留空 = 不修改该值;名称当前为只读)");
     });
@@ -917,10 +960,10 @@ impl GuiApp {
         }
       }
       if ui
-        .add_enabled(!self.busy && self.target.is_some(), egui::Button::new("保存为新文件"))
+        .add_enabled(!self.busy && self.target.is_some(), egui::Button::new("写入原存档 (先自动备份)"))
         .clicked()
       {
-        self.save_target_to_new_file(ui);
+        self.save_target_in_place(ui);
       }
       if self.dirty {
         ui.label(egui::RichText::new("● 有未保存修改").color(egui::Color32::LIGHT_YELLOW));
@@ -1159,7 +1202,7 @@ impl GuiApp {
     ui.label("· 角色存档: data001Slot.bin ~ data003Slot.bin(游戏内最多 3 个角色槽,即读档界面的 3 个存档位)");
     ui.label("· 系统存档: data00-1.bin(全局数据,一般不需要修改);SS1_* / SS4_* / SS7_* 是相册数据");
     ui.label(
-      "· 推荐流程: 备份 → 编辑 → 保存为新文件 → 关闭游戏 → 用输出文件替换原存档 → 进游戏确认",
+      "· 推荐流程: 备份 → 编辑 → 写入原存档(自动先备份整个目录)→ 进游戏确认;“保存为新文件”则输出 <原名>.edited.bin,需手动替换原文件",
     );
     ui.label("· Steam 云同步: 编辑时建议让 Steam 离线,避免云端旧档覆盖");
     ui.label("· 角色存档必须由游戏创建过(空槽没有引导存档时,游戏不会识别放入的文件)");
@@ -1173,26 +1216,16 @@ impl GuiApp {
   fn show_save_bar(&mut self, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
       let ready = !self.busy && self.target.is_some();
-      if ui.add_enabled(ready, egui::Button::new("保存为新文件")).clicked()
-        && let Some(opened) = self.target.as_ref()
-      {
-        let output = derived_output(&opened.path, "edited");
-        if output == opened.path {
-          self.log_line("✘ 输出路径与源文件相同;源存档永远不会被修改");
-        } else {
-          let document = Box::new(OpenedSave {
-            path: opened.path.clone(),
-            document: opened.document.clone(),
-            hunter_name: opened.hunter_name.clone(),
-            box_items: opened.box_items.clone(),
-          });
-          self.spawn(ui.ctx(), WorkerTask::Save { document, output });
-        }
+      if ui.add_enabled(ready, egui::Button::new("写入原存档 (先自动备份)")).clicked() {
+        self.save_target_in_place(ui);
+      }
+      if ui.add_enabled(ready, egui::Button::new("保存为新文件")).clicked() {
+        self.save_target_to_new_file(ui);
       }
       if self.dirty {
         ui.label("● 有未保存修改 (内存中)");
       }
-      ui.label("输出文件: <原名>.edited.bin,替换原存档前请关闭游戏");
+      ui.label("关闭游戏后再写入;“写入原存档”会先把整个存档目录备份到 文档\\MHR-Save-Backups");
     });
   }
 
