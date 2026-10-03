@@ -23,8 +23,9 @@ const TAB_INFO: usize = 0;
 const TAB_PLAYER: usize = 1;
 const TAB_ITEMBOX: usize = 2;
 const TAB_TRANSFER: usize = 3;
-const TAB_BACKUP: usize = 4;
-const TAB_HELP: usize = 5;
+const TAB_PROGRESS: usize = 4;
+const TAB_BACKUP: usize = 5;
+const TAB_HELP: usize = 6;
 
 /// Loads a single-face CJK .ttf font. egui's text rasterizer (ab_glyph) does
 /// NOT support .ttc collections, which is why msyh.ttc/simsun.ttc cannot be
@@ -123,6 +124,15 @@ pub struct GuiApp {
   xfer_item_my_set: bool,
   /// Backup awaiting a second confirming click on 还原.
   restore_confirm: Option<PathBuf>,
+  /// Point-accumulator inputs on the 进度与解禁 tab (HR/MR/anomaly research).
+  hr_point_input: String,
+  mr_point_input: String,
+  mystery_point_input: String,
+  /// Unlock-flag toggles on the 进度与解禁 tab, parallel to
+  /// [`edit::GUILD_FLAGS`].
+  guild_flags: Vec<bool>,
+  /// Transfer toggle: copy ProgressSaveData (ranks + points).
+  xfer_progress: bool,
 }
 
 /// (label, item-table categories) groups for the item-box transfer filter.
@@ -143,6 +153,7 @@ impl GuiApp {
       xfer_equip_box: true,
       xfer_equip_manager: true,
       xfer_item_my_set: true,
+      guild_flags: vec![false; edit::GUILD_FLAGS.len()],
       ..Self::default()
     };
     app.log_line(&font_status);
@@ -159,6 +170,30 @@ impl GuiApp {
       ));
     }
     app
+  }
+
+  /// Re-reads ranks/points/flag inputs from the opened document.
+  fn refresh_progress_inputs(&mut self) {
+    let Some(opened) = self.target.as_ref() else {
+      return;
+    };
+    let payload = opened.document.payload();
+    if let Some(ranks) = edit::read_ranks(payload) {
+      self.hunter_rank_input = ranks.hunter.to_string();
+      self.master_rank_input = ranks.master.to_string();
+      self.mystery_rank_input = ranks.mystery_research.to_string();
+    }
+    let points = |hash: u32| -> String {
+      edit::read_scalar(payload, edit::PROGRESS_SAVE_CLASS, hash)
+        .map(|value| value.to_string())
+        .unwrap_or_default()
+    };
+    self.hr_point_input = points(edit::HUNTER_RANK_POINT);
+    self.mr_point_input = points(edit::MASTER_RANK_POINT);
+    self.mystery_point_input = points(edit::MYSTERY_RESEARCH_POINT);
+    if let Some(flags) = edit::read_guild_flags(payload) {
+      self.guild_flags = flags.into_iter().map(|(_, value)| value).collect();
+    }
   }
 
   fn log_line(&mut self, text: &str) {
@@ -620,6 +655,7 @@ impl eframe::App for GuiApp {
               self.mystery_rank_input =
                 ranks.map(|r| r.mystery_research.to_string()).unwrap_or_default();
               self.box_edits = vec![String::new(); opened.box_items.len()];
+              self.refresh_progress_inputs();
               self.log_line(&format!(
                 "✔ 已打开{}: {} ({})",
                 if is_source { "来源存档" } else { "目标存档" },
@@ -698,6 +734,7 @@ impl eframe::App for GuiApp {
           TAB_PLAYER => self.show_player_tab(ui),
           TAB_ITEMBOX => self.show_itembox_tab(ui),
           TAB_TRANSFER => self.show_transfer_tab(ui),
+          TAB_PROGRESS => self.show_progress_tab(ui),
           TAB_BACKUP => self.show_backup_tab(ui),
           _ => self.show_help_tab(ui),
         }
@@ -830,6 +867,7 @@ impl GuiApp {
         (TAB_PLAYER, "玩家数据"),
         (TAB_ITEMBOX, "道具箱编辑"),
         (TAB_TRANSFER, "存档转移"),
+        (TAB_PROGRESS, "进度与解禁"),
         (TAB_BACKUP, "备份还原"),
         (TAB_HELP, "帮助"),
       ] {
@@ -1116,6 +1154,23 @@ impl GuiApp {
 
     ui.add_space(6.0);
     ui.separator();
+    ui.heading("进度转移");
+    ui.horizontal(|ui| {
+      ui.checkbox(&mut self.xfer_progress, "等级进度 (HR/MR/怪异研究等级 + 点数)");
+    });
+    ui.horizontal(|ui| {
+      let both_ready = !self.busy && self.source.is_some() && self.xfer_progress;
+      if ui.add_enabled(both_ready, egui::Button::new("转移等级进度")).clicked() {
+        match self.transfer_progress() {
+          Ok(text) => self.log_line(&format!("✔ {text} (内存中)")),
+          Err(error) => self.log_line(&format!("✘ {error}")),
+        }
+      }
+      ui.label("⚠ 新档未完成解禁任务时,转移后的等级仍会被游戏钳制在当前上限内");
+    });
+
+    ui.add_space(6.0);
+    ui.separator();
     ui.heading("装备转移");
     ui.horizontal(|ui| {
       ui.checkbox(&mut self.xfer_equip_box, "装备箱 (武器/防具/护石)");
@@ -1142,6 +1197,147 @@ impl GuiApp {
       );
     }
     ui.label("转移在内存中立即生效;确认无误后用下方“保存为新文件”写盘。");
+  }
+
+  fn show_progress_tab(&mut self, ui: &mut egui::Ui) {
+    if self.target.is_none() {
+      ui.label("先用顶部“快速选择”或“浏览…”打开一个存档。");
+      return;
+    }
+    ui.heading("等级与累计点数");
+    ui.label("点数是升级时的累计进度,等级钳制解除后游戏按点数推进等级;留空 = 不修改。");
+    ui.add_space(4.0);
+    Grid::new("progress-points").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+      let row = |ui: &mut egui::Ui, label: &str, text: &mut String| {
+        ui.label(label);
+        ui.add_sized([200.0, 20.0], egui::TextEdit::singleline(text));
+        ui.end_row();
+      };
+      row(ui, "猎人等级点数 (HR Point)", &mut self.hr_point_input);
+      row(ui, "大师等级点数 (MR Point)", &mut self.mr_point_input);
+      row(ui, "怪异研究点数", &mut self.mystery_point_input);
+    });
+    ui.horizontal(|ui| {
+      if ui.add_enabled(!self.busy, egui::Button::new("应用点数修改")).clicked() {
+        match self.apply_point_edits() {
+          Ok(text) => self.log_line(&format!("✔ {text} (内存中)")),
+          Err(error) => self.log_line(&format!("✘ {error}")),
+        }
+      }
+      ui.label("(点数仅是进度累积,不改变解禁钳制;1 ≤ 值 ≤ 99999999)");
+    });
+
+    ui.add_space(8.0);
+    ui.separator();
+    ui.heading("名片解禁标志 (显示副本)");
+    ui.horizontal_wrapped(|ui| {
+      for ((_, label), on) in edit::GUILD_FLAGS.iter().zip(&mut self.guild_flags) {
+        ui.checkbox(on, *label);
+      }
+    });
+    ui.horizontal(|ui| {
+      if ui.add_enabled(!self.busy, egui::Button::new("应用名片标志")).clicked() {
+        let values: Vec<(u32, bool)> = edit::GUILD_FLAGS
+          .iter()
+          .zip(&self.guild_flags)
+          .map(|((hash, _), on)| (*hash, *on))
+          .collect();
+        match self.apply_guild_flags(&values) {
+          Ok(text) => self.log_line(&format!("✔ {text} (内存中)")),
+          Err(error) => self.log_line(&format!("✘ {error}")),
+        }
+      }
+      ui.label("这些是猎人名片上的显示副本;实测解禁钳制不完全由它们决定");
+    });
+
+    ui.add_space(8.0);
+    ui.separator();
+    ui.heading("为什么改了等级却不生效?");
+    ui.label("· 游戏对等级有解禁钳制:未完成对应解禁任务链时,读档会提示获得成就,但显示等级仍被压回当前上限");
+    ui.label("· 解禁状态记录在任务清通标志位图中(打包结构,任务到位的映射需要游戏数据表),本工具暂不自动改写");
+    ui.label("· 想让新档达到高等级:在游戏内完成解禁任务,或用“存档转移”把高等级档的装备/道具/等级进度搬过来(解禁仍受任务进度约束)");
+  }
+
+  /// Applies the three point-accumulator edits from the 进度与解禁 tab.
+  fn apply_point_edits(&mut self) -> Result<String, String> {
+    let parse = |text: &str, name: &str| -> Result<Option<u32>, String> {
+      let trimmed = text.trim();
+      if trimmed.is_empty() {
+        return Ok(None);
+      }
+      let value = trimmed.parse::<u32>().map_err(|_| format!("{name} 必须是数字: {text:?}"))?;
+      if value == 0 || value > 99_999_999 {
+        return Err(format!("{name} 超出范围 (1-99999999): {value}"));
+      }
+      Ok(Some(value))
+    };
+    let hr = parse(&self.hr_point_input, "猎人等级点数")?;
+    let mr = parse(&self.mr_point_input, "大师等级点数")?;
+    let mystery = parse(&self.mystery_point_input, "怪异研究点数")?;
+    let Some(opened) = self.target.as_mut() else {
+      return Err("尚未打开目标存档".to_owned());
+    };
+    let mut applied = 0usize;
+    for (value, hash, label) in [
+      (hr, edit::HUNTER_RANK_POINT, "_HunterRankPoint"),
+      (mr, edit::MASTER_RANK_POINT, "_MasterRankPoint"),
+      (mystery, edit::MYSTERY_RESEARCH_POINT, "_MysteryResearchPoint"),
+    ] {
+      if let Some(value) = value
+        && value != edit::read_scalar(opened.document.payload(), edit::PROGRESS_SAVE_CLASS, hash)
+          .unwrap_or(0)
+      {
+        edit::set_scalar(opened.document.payload_mut(), edit::PROGRESS_SAVE_CLASS, hash, value, label)
+          .map_err(|error| error.to_string())?;
+        applied += 1;
+      }
+    }
+    if applied == 0 {
+      return Err("没有可应用的修改".to_owned());
+    }
+    self.dirty = true;
+    Ok(format!("更新了 {applied} 项点数"))
+  }
+
+  /// Copies ProgressSaveData (ranks + point accumulators) from the source.
+  fn transfer_progress(&mut self) -> Result<String, String> {
+    {
+      let Some(source) = self.source.as_ref() else {
+        return Err("尚未打开来源存档".to_owned());
+      };
+      let Some(target) = self.target.as_mut() else {
+        return Err("尚未打开目标存档".to_owned());
+      };
+      edit::copy_class_fields(
+        target.document.payload_mut(),
+        source.document.payload(),
+        edit::PROGRESS_SAVE_CLASS,
+      )
+      .map_err(|error| error.to_string())?;
+    }
+    self.refresh_target_items();
+    self.refresh_progress_inputs();
+    let ranks = self
+      .target
+      .as_ref()
+      .and_then(|target| edit::read_ranks(target.document.payload()));
+    Ok(format!(
+      "等级进度转移完成;目标现为 HR {} / MR {} / 怪异研究 {}",
+      ranks.map(|r| r.hunter).unwrap_or(0),
+      ranks.map(|r| r.master).unwrap_or(0),
+      ranks.map(|r| r.mystery_research).unwrap_or(0)
+    ))
+  }
+
+  /// Applies guild card unlock flags from the 进度与解禁 tab.
+  fn apply_guild_flags(&mut self, values: &[(u32, bool)]) -> Result<String, String> {
+    let Some(opened) = self.target.as_mut() else {
+      return Err("尚未打开目标存档".to_owned());
+    };
+    let updated = edit::set_guild_flags(opened.document.payload_mut(), values)
+      .map_err(|error| error.to_string())?;
+    self.dirty = true;
+    Ok(format!("更新了 {updated} 个名片标志"))
   }
 
   fn show_backup_tab(&mut self, ui: &mut egui::Ui) {

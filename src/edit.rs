@@ -62,6 +62,104 @@ pub const MYSTERY_RESEARCH_POINT: u32 = 0x71a2_e552;
 /// `GuildCardData.LaboLv` — the self card's copy of the 怪异研究等级.
 pub const GUILD_CARD_LABO_LV: u32 = 0x665f_00e3;
 
+/// `GuildCardData` self-card unlock flags (bool scalars, byte-sized).
+pub const GUILD_FLAG_IS_OTOMO_SECRET_UNLOCKED: u32 = 0x4419_1620;
+pub const GUILD_FLAG_IS_MR_RELEASE: u32 = 0xba45_9644;
+pub const GUILD_FLAG_IS_MR_DISP: u32 = 0x4555_11ab;
+pub const GUILD_FLAG_IS_SERVANT_QUEST_UNLOCKED: u32 = 0x8547_337b;
+pub const GUILD_FLAG_IS_MYSTERY_QUEST_UNLOCKED: u32 = 0x00be_17fd;
+pub const GUILD_FLAG_IS_END_CONTENTS_UNLOCKED: u32 = 0xcd20_735c;
+pub const GUILD_FLAG_IS_CUSTOM_WEAPON_EDIT_UNLOCKED: u32 = 0x75e8_dceb;
+pub const GUILD_FLAG_IS_SPECIAL_MYSTERY_UNLOCKED: u32 = 0x158c_02bf;
+
+/// (field hash, human label) of the guild card unlock flags, in display
+/// order for the GUI.
+pub const GUILD_FLAGS: [(u32, &str); 8] = [
+  (GUILD_FLAG_IS_MR_RELEASE, "大师等级解禁 (isMRRelease)"),
+  (GUILD_FLAG_IS_MR_DISP, "显示大师等级 (isMRDisp)"),
+  (GUILD_FLAG_IS_MYSTERY_QUEST_UNLOCKED, "怪异调查任务解锁"),
+  (GUILD_FLAG_IS_SPECIAL_MYSTERY_UNLOCKED, "特别怪异调查解锁"),
+  (GUILD_FLAG_IS_END_CONTENTS_UNLOCKED, "终盘内容解锁"),
+  (GUILD_FLAG_IS_SERVANT_QUEST_UNLOCKED, "随从任务解锁"),
+  (GUILD_FLAG_IS_OTOMO_SECRET_UNLOCKED, "随从秘密解锁"),
+  (GUILD_FLAG_IS_CUSTOM_WEAPON_EDIT_UNLOCKED, "自定义武器编辑解锁"),
+];
+
+/// Reads the self guild card's unlock flags as (hash, value) pairs. Buddy
+/// cards (nested in arrays) are never consulted.
+pub fn read_guild_flags(payload: &SavePayload) -> Option<Vec<(u32, bool)>> {
+  fn read(class: &Class, out: &mut Option<Vec<(u32, bool)>>) {
+    if out.is_some() {
+      return;
+    }
+    if class.hash == GUILD_CARD_CLASS {
+      let mut flags = Vec::new();
+      for (hash, _) in GUILD_FLAGS {
+        let value = class.fields.iter().find(|field| field.hash == hash).and_then(|field| {
+          match &field.value {
+            FieldValue::Scalar { bytes, size: 1 } if bytes.len() == 1 => Some(bytes[0] != 0),
+            _ => None,
+          }
+        });
+        match value {
+          Some(value) => flags.push((hash, value)),
+          // Missing flag: schema drift; report the card as unreadable.
+          None => return,
+        }
+      }
+      *out = Some(flags);
+      return;
+    }
+    for field in &class.fields {
+      if let FieldValue::Class(nested) = &field.value {
+        read(nested, out);
+        if out.is_some() {
+          return;
+        }
+      }
+    }
+  }
+  let mut out = None;
+  for entry in &payload.entries {
+    read(&entry.class, &mut out);
+    if out.is_some() {
+      break;
+    }
+  }
+  out
+}
+
+/// Writes the self guild card's unlock flags. Only byte-sized bool scalars
+/// for the listed hashes are touched; buddy cards are never reached.
+pub fn set_guild_flags(payload: &mut SavePayload, values: &[(u32, bool)]) -> Result<usize> {
+  fn update(class: &mut Class, values: &[(u32, bool)], updated: &mut usize) {
+    if class.hash == GUILD_CARD_CLASS {
+      for field in &mut class.fields {
+        if let Some(&(_, flag)) = values.iter().find(|(hash, _)| *hash == field.hash)
+          && let FieldValue::Scalar { size: 1, bytes } = &mut field.value
+          && bytes.len() == 1
+        {
+          *bytes = vec![u8::from(flag)];
+          *updated += 1;
+        }
+      }
+    }
+    for field in &mut class.fields {
+      if let FieldValue::Class(nested) = &mut field.value {
+        update(nested, values, updated);
+      }
+    }
+  }
+  let mut updated = 0usize;
+  for entry in &mut payload.entries {
+    update(&mut entry.class, values, &mut updated);
+  }
+  if updated == 0 {
+    bail!("self guild card not found; refusing to write unlock flags");
+  }
+  Ok(updated)
+}
+
 /// The three progression ranks, from `ProgressSaveData`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Ranks {
