@@ -1,109 +1,69 @@
-# MHRise Save Editor
+# MHRise Save Editor(怪物猎人崛起 Steam 版存档编辑器)
 
-A Steam-only tool for inspecting, dumping, editing, and repacking *Monster Hunter Rise* (Steam / `win64_save`) save files. Built for editing in-save values (items, counts, and similar) and for transferring data between the three save slots (`data001Slot.bin` … `data003Slot.bin`).
+一个仅面向 Steam 版《怪物猎人崛起:曙光》的存档查看、编辑与转移工具,操作 `win64_save` 目录下的三个角色存档(`data001Slot.bin` ~ `data003Slot.bin`)。
 
 > [!WARNING]
-> Always back up your saves (`backup` command) and edit with the game closed. Field mappings were verified against real saves (wallet, points, item box, equipment); unusual edits may still behave unexpectedly — test on a throwaway slot first.
+> 编辑存档前请务必先备份(工具内「备份还原」页一键完成,CLI 用 `backup` 命令),并保持游戏关闭。所有字段映射均在真实存档上核验过(金钱、点数、道具箱、装备、等级、组合),但极端修改仍可能出现意外——请先在丢弃用槽位上试验。
 
-## GUI
+## 工作原理
 
+### 存档容器:DSSS v2 + Citrus 加密
+- 文件头为 `DSSS` v2 容器,Steam 版 flags 含 CITRUS(0x04)标记;
+- Citrus 体系:**SteamID64 派生 ECC 密钥 → AES-128-CBC 解密数据块**,每块带 SHA3-256 哈希,块大小 0x40000,尾部 0x1000 块(可为零);
+- 曲线索引从 128 条预置曲线中按"解密后块哈希校验"暴力探测,因此**只需提供 SteamID64**(17 位数字 = 76561197960265728 + 32 位账号 ID;账号 ID 即 `userdata\<账号ID>\` 目录名,GUI 会自动推算);
+- 外层校验和为声明长度前缀的 MurmurHash3(seed 0xffffffff)。
+- 容器与加解密实现移植自 MIT 协议的 [jinghaihan/mhrise-save-converter](https://github.com/jinghaihan/mhrise-save-converter)(其研究基于 [kvasszn/ree-save-editor](https://github.com/kvasszn/ree-save-editor)),本仓库其余部分为原创。
+
+### 类流:RSZ 结构与字段哈希
+解密后是 RE 引擎的 RSZ 类流(`native_hash` + `class{hash, fields[]}`)。**本项目的关键发现:字段/类哈希 = murmur3_32(字段名, seed 0xffffffff)**,与社区 RSZ 字典(`assets/mhrise/rszmhrise.json`,25 万条)对照覆盖率 99.98%。所有编辑都以"类哈希 + 字段哈希"双重约束定位,防止同名误伤。
+
+已核验的主要结构(类 → 关键字段):
+
+| 类 | 哈希 | 内容 |
+|---|---|---|
+| `snow.data.HandMoney` | `079713ac` | `_Value` 当前金钱、`_TotalAddedValue` 累计 |
+| `snow.data.VillagePoint` | `306735ee` | `_Point` 隐藏点/怪异点 |
+| `snow.data.ItemBox` | `67696161` | `_InventoryList`:1800 × (ItemId, Num),空槽 = `0x04000000` |
+| `snow.data.EquipBox` | `f0509899` | `_WeaponArmorInventoryList`:5000 × EquipmentInventoryData(武器/防具/护石) |
+| `snow.data.EquipDataManager.SaveData1` | `960baed3` | `_PlEquipPack` 当前穿着、`_PlEquipMySetList`(装备组合×224)、`_HunterMySetList`(猎人组合×224)、`_PlArmorColorMySetData` |
+| `snow.equip.PlEquipMySetData` | `d897238a` | 装备组合:`_Name`、`_IsUsing`、`_InventoryIndexList`(装备箱索引表) |
+| `snow.data.HunterMySetData` | `af140835` | 猎人组合:`_Name` + `_ItemMysetIndex`/`_EquipMysetIndex`/`_OverwearMysetIndex` |
+| `snow.data.ItemMySet` | `8923cd68` | 道具袋组合 ×40 |
+| `snow.progress.ProgressSaveData` | `948b7b9d` | `_HunterRank/_MasterRank/_MysteryResearchLevel` + 各自 Point(等级权威数据) |
+| `snow.data.GuildCardData` | `44541321` | 自名片:猎人名、等级显示副本(HunterRank/`_MasterRank`/LaboLv)、解禁布尔(isMRRelease 等);好友名片在数组中,绝不触碰 |
+
+中文道具名(`assets/mhrise/item_names_cn.json`,1771 条)来自社区 16.0.0 道具表,与游戏内部枚举(`item_names.json`)按数值 ID 对齐。
+
+## 主要功能
+
+### GUI(`mhrise-save-editor-gui`)
+- **自动发现存档**:读注册表 + Steam 库配置扫描所有 `userdata\<账号>\1446780\remote\win64_save`,快速选择自动填 SteamID64;
+- **一般信息**:猎人名、等级(HR/MR/怪异研究)、金钱点数、容器信息;
+- **玩家数据**:金钱、累计金钱、点数、三项等级编辑(应用后内存生效,保存时写盘);
+- **道具箱编辑**:1800 槽中文道具名(可按名称/类别/ID 过滤)、单件数量修改、清空与新增;
+- **存档转移**(同 Steam 账号的槽位间,均内存生效、统一写盘):
+  - 道具箱按类别合并(消耗品/素材/弹药·瓶/换金·古董/其它),未勾选类别保留目标原样;
+  - 装备转移按组件勾选(装备箱 / 穿着与装备组合登记 / 道具袋组合);
+  - 等级进度转移(三项等级 + 点数);
+- **进度与解禁**:等级点数编辑、名片解禁标志(显示副本)读写,并说明解禁钳制机制;
+- **备份还原**:一键整目录备份到 `文档\MHR-Save-Backups\<账号>\<时间戳>`(逐字节校验、避开云同步范围),双击确认还原并自动重载;
+- **写入原存档 (先自动备份)**:写盘前自动整目录备份,免去手动替换 `.edited.bin`;也可选「保存为新文件」手动替换;
+- 后台线程执行所有 IO,UI 不卡顿;所有写盘操作都有备份兜底。
+
+### CLI(`mhrise-save-editor`)
+`inspect`(容器信息+等级)、`dump-json` / `apply-json`(无损 JSON 导出/回写)、`repack` / `roundtrip`(往返校验)、`backup` / `restore`、`diff`(两档结构差异)、`set-money` / `set-points`、`transfer-items` / `transfer-equipment`。
+
+## 已知限制
+- **等级解禁钳制**:未完成解禁任务链的存档,读档后游戏会把等级压回当前上限(会弹"获得成就"提示)。解禁状态在任务清通标志位图中(游戏特有打包结构,任务→位的映射需要游戏数据表),本工具暂不自动改写;建议游戏内解禁或用转移搬运进度。
+- **任务标志**:同上,位图映射未逆向,不做自动修改。
+- **中文输入**:winit 窗口库与 TSF 模式输入法的已知兼容问题;微软拼音开启「使用以前版本」兼容模式即可(详见帮助页)。
+- 装备具体名称(武器/防具名)不在存档内,需要游戏数据表才能显示,当前以 ID 展示。
+
+## 开发
 ```bash
+cargo test          # 54 个单元/集成测试
 cargo run --release --bin mhrise-save-editor-gui
+scripts/package.py  # 打包 release 双 exe + README + LICENSE 到 dist/
 ```
 
-Pick a target save, optionally a source save (for transfers), enter your SteamID64, and use the buttons to read save info, set wallet/points, transfer the item box, or transfer the whole equipment complex (equipment box + talismans + loadout registers + worn pack). Every operation runs in the background and writes a NEW file (`<name>.edited.bin` / `<name>.transferred.bin`) next to the chosen save; swap it in with the game closed.
-
-### Chinese input not working (no candidates, keystrokes swallowed)?
-
-Known winit (windowing library) incompatibility with TSF-mode IMEs — it affects every winit-based app, not this tool's save logic. Fix for Microsoft Pinyin: Windows Settings → Time & language → Language & region → Chinese → Microsoft Pinyin → General → Compatibility → turn on **"Use previous version of Microsoft input method"** (使用以前版本的 Microsoft 输入法). Third-party IMEs (Sogou etc.) may show the same problem; switch to compatibility-mode Microsoft Pinyin when editing. Set `MHR_IME_DEBUG=1` to log every keyboard/IME event egui receives into `ime_debug.log` next to the working directory when reporting issues.
-
-## Attribution
-
-The DSSS container, Citrus, and RE Engine class-stream handling in `src/crypto/`, `src/format.rs`, `src/payload.rs`, and `src/discover.rs` is ported verbatim from the MIT-licensed [jinghaihan/mhrise-save-converter](https://github.com/jinghaihan/mhrise-save-converter), whose format research builds on [kvasszn/ree-save-editor](https://github.com/kvasszn/ree-save-editor). Everything else in this repository is original to this project.
-
-## Installation
-
-```bash
-cargo install --path .
-```
-
-## Usage
-
-All commands need your **SteamID64** — the 17-digit numeric ID of the account that owns the save (a numeric Steam profile URL looks like `steamcommunity.com/profiles/<STEAMID64>`). The Curve Index is detected from the save itself.
-
-```bash
-# Show header, platform, and checksum status for a save file or directory
-mhrise-save-editor inspect <file-or-dir>
-
-# Decrypt + parse a save into a human-readable JSON tree
-mhrise-save-editor dump-json data001Slot.bin --steamid64 76561198000000000 -o slot1.json
-
-# Load an edited JSON back onto the save and write a new save file
-mhrise-save-editor apply-json data001Slot.bin slot1.json --steamid64 76561198000000000 -o slot1.edited.bin
-
-# Repack a save without changing anything (round-trip check)
-mhrise-save-editor repack data001Slot.bin --steamid64 76561198000000000 -o slot1.repacked.bin
-
-# Report whether parse -> encode reproduces the decrypted payload byte-for-byte
-mhrise-save-editor roundtrip data001Slot.bin --steamid64 76561198000000000
-
-# Set the wallet amount (and optionally the lifetime money-gained counter)
-mhrise-save-editor set-money data001Slot.bin --steamid64 76561198000000000 --value 99999999
-
-# Set the Kamura/Steady point balance
-mhrise-save-editor set-points data001Slot.bin --steamid64 76561198000000000 --value 500000
-
-# Structurally diff two saves (fresh vs progressed character), aggregated by field path
-mhrise-save-editor diff fresh.bin progressed.bin --steamid64 76561198000000000
-
-# Replace the target character's item box with the source character's item box
-# (both saves must belong to the same Steam account)
-mhrise-save-editor transfer-items new-character.bin old-character.bin --steamid64 76561198000000000
-
-# Back up an entire save directory (verbatim copy, byte-verified).
-# For a real Steam layout the backup goes to Documents\MHR-Save-Backups\<account>\
-# so it stays outside the Steam Cloud sync scope.
-mhrise-save-editor backup ".../userdata/<account>/1446780/remote/win64_save"
-
-# Restore a backup into a directory; overwriting existing files needs --force
-mhrise-save-editor restore ".../Documents/MHR-Save-Backups/<account>/<timestamp>" ".../userdata/<account>/1446780/remote/win64_save" --force
-```
-
-The source save is never modified; every writing command produces a new file.
-
-### No save at hand?
-
-`cargo run --example make_fixture -- <dir>` generates a synthetic Steam save (`data001Slot.bin`) for trying every command, with SteamID64 `76561198382766028`.
-
-### Reading `roundtrip` results
-
-- `Structural roundtrip: OK` — the re-encoded payload parses back to the identical tree. This is the property edits rely on.
-- `Byte roundtrip: BYTE-IDENTICAL` — best case.
-- `Byte roundtrip: DIFFERS` — expected on real saves: the game leaves stale memory bytes in alignment-padding gaps, while a re-encode writes zeros there. Verified on real saves: all differing bytes sit in parser-skipped padding, lengths and structure match exactly, and the game demonstrably accepts zero-filled gaps (this encoding path is what the upstream converter's tested Switch→Steam conversion uses). The decisive acceptance test is loading a `repack`ed save in the game.
-
-### Safety workflow
-
-1. `backup` the `win64_save` directory (byte-verified copy) before any testing.
-2. `roundtrip` a core save — expect structural OK.
-3. `repack` a copy and load it into the game with Steam in offline mode — it must behave like the original.
-4. Only then edit JSON and `apply-json` it, and test the result the same way.
-5. If anything looks wrong in game: close the game, `restore` the backup with `--force`.
-
-## How it fits together
-
-| Layer | Module | Role |
-| --- | --- | --- |
-| Container | `format.rs` | DSSS v2 header, platform flags, MurmurHash3 outer checksum |
-| Crypto | `crypto/` | Citrus: SteamID64-derived ECC keys, AES-128-CBC, SHA3-256 block hashes, curve brute-force |
-| Payload | `payload.rs` | RE Engine class stream: parse / edit / re-encode with alignment |
-| Document | `container.rs` | open → edit → write for Steam core saves |
-| Archive | `archive.rs` | byte-verified whole-directory backup / restore |
-| JSON | `json.rs` | lossless payload ⇄ JSON dump/load |
-
-### JSON dump rules
-
-`hash`es and `type`s are hex strings. For scalars, `hex` holds the exact little-endian bytes and is **authoritative** when loading; `value` (unsigned-integer view, sizes ≤ 8) and `float` (f32/f64 view) are display-only — the loader refuses a dump whose display fields no longer match `hex`, so an edit in the wrong field fails loudly instead of being silently dropped. Strings carry their exact UTF-16 `units` (plus a lossy `value` for reading).
-
-## License
-
-[MIT](./LICENSE) License © ChevalGrand
+代码结构:`src/container.rs`(DSSS/Citrus 容器)、`src/crypto/`(AES/ECC/SHA3)、`src/payload.rs`(RSZ 类流解析)、`src/edit.rs`(字段定位与编辑,含全部已核验哈希常量)、`src/items.rs`(道具名表)、`src/archive.rs`(备份)、`src/discover.rs`(存档发现)、`src/gui.rs`(eframe 界面)、`src/main.rs`(CLI)。Rust 2024 edition,`unsafe_code = forbid`。
