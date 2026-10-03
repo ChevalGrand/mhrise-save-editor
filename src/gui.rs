@@ -107,12 +107,34 @@ pub struct GuiApp {
   log: String,
   receiver: Option<Receiver<WorkerEvent>>,
   tab: usize,
+  /// Item-category toggles for the transfer filter, parallel to
+  /// [`ITEM_CATEGORY_GROUPS`].
+  xfer_cats: Vec<bool>,
+  xfer_equip_box: bool,
+  xfer_equip_manager: bool,
+  xfer_item_my_set: bool,
 }
+
+/// (label, item-table categories) groups for the item-box transfer filter.
+/// Ids missing from the name table follow the last ("其它/未知") toggle.
+const ITEM_CATEGORY_GROUPS: &[(&str, &[&str])] = &[
+  ("消耗品", &["Consume"]),
+  ("素材", &["Material", "OffcutsMaterial"]),
+  ("弹药·瓶", &["Bullet", "Bottle"]),
+  ("换金·古董", &["PayOff", "CarryPayOff", "Antique"]),
+  ("其它/工具/未知", &["Tool"]),
+];
 
 impl GuiApp {
   pub fn new(creation_context: &eframe::CreationContext) -> Self {
     let font_status = install_cjk_font(&creation_context.egui_ctx);
-    let mut app = Self::default();
+    let mut app = Self {
+      xfer_cats: vec![true; ITEM_CATEGORY_GROUPS.len()],
+      xfer_equip_box: true,
+      xfer_equip_manager: true,
+      xfer_item_my_set: true,
+      ..Self::default()
+    };
     app.log_line(&font_status);
     app.discovered = discover_steam_slot_files();
     if let Some((_, _, Some(account))) = app.discovered.first() {
@@ -261,42 +283,104 @@ impl GuiApp {
     Ok(format!("{} 处更新,{} 个新物品填入空槽", report.applied, report.filled))
   }
 
-  fn transfer(&mut self, equipment: bool) -> Result<String, String> {
+  /// Merge-transfer only the source item slots whose category group is
+  /// enabled; other slots keep the target's contents.
+  fn transfer_items_filtered(&mut self) -> Result<String, String> {
+    let Some(source) = self.source.as_ref() else {
+      return Err("尚未打开来源存档".to_owned());
+    };
+    let groups: Vec<&[&str]> = ITEM_CATEGORY_GROUPS
+      .iter()
+      .zip(&self.xfer_cats)
+      .filter(|(_, on)| **on)
+      .map(|((_, cats), _)| *cats)
+      .collect();
+    let other_allowed = *self.xfer_cats.last().unwrap_or(&false);
+    let keep = move |id: u32| match crate::items::item_category(id) {
+      Some(category) => groups.iter().any(|group| group.contains(&category)),
+      // Ids missing from the name table follow the 其它/未知 toggle.
+      None => other_allowed,
+    };
+    let Some(target) = self.target.as_mut() else {
+      return Err("尚未打开目标存档".to_owned());
+    };
+    let report = edit::transfer_item_box_filtered(target.document.payload_mut(), source.document.payload(), keep)
+      .map_err(|error| error.to_string())?;
+    self.refresh_target_items();
+    Ok(format!(
+      "道具箱合并完成: {} 槽中取自来源 {} 件,保留目标 {} 件 (来源共 {} 件道具)",
+      report.slots, report.transferred, report.kept, report.source_items
+    ))
+  }
+
+  /// Transfer only the ticked equipment components.
+  fn transfer_equipment_selected(&mut self) -> Result<String, String> {
     let Some(source) = self.source.as_ref() else {
       return Err("尚未打开来源存档".to_owned());
     };
     let Some(target) = self.target.as_mut() else {
       return Err("尚未打开目标存档".to_owned());
     };
-    let message = if equipment {
-      let report =
-        edit::transfer_equipment(target.document.payload_mut(), source.document.payload())
-          .map_err(|error| error.to_string())?;
-      format!(
-        "装备转移完成: {};装备箱 {} 槽 {} 件",
-        report
-          .classes
-          .iter()
-          .map(|(label, fields)| format!("{label}={fields}字段"))
-          .collect::<Vec<_>>()
-          .join(", "),
-        report.box_slots,
-        report.box_used
-      )
-    } else {
-      let report =
-        edit::transfer_item_box(target.document.payload_mut(), source.document.payload())
-          .map_err(|error| error.to_string())?;
-      format!("道具箱转移完成: {} 槽,{} 件道具", report.slots, report.items)
+    let parts = edit::EquipParts {
+      equip_box: self.xfer_equip_box,
+      equip_manager: self.xfer_equip_manager,
+      item_my_set: self.xfer_item_my_set,
     };
-    target.box_items = edit::read_item_box(target.document.payload())
-      .map_err(|error| error.to_string())?
-      .into_iter()
-      .map(|entry| (entry.id, entry.num))
-      .collect();
-    self.box_edits = vec![String::new(); target.box_items.len()];
+    let report =
+      edit::transfer_equipment_parts(target.document.payload_mut(), source.document.payload(), parts)
+        .map_err(|error| error.to_string())?;
+    self.refresh_target_items();
+    let partial = parts != edit::EquipParts::all();
+    Ok(format!(
+      "装备转移完成: {};装备箱 {} 槽 {} 件{}",
+      report
+        .classes
+        .iter()
+        .map(|(label, fields)| format!("{label}={fields}字段"))
+        .collect::<Vec<_>>()
+        .join(", "),
+      report.box_slots,
+      report.box_used,
+      if partial { " (部分转移:进游戏后请先检查穿着与装备组合)" } else { "" }
+    ))
+  }
+
+  /// Re-reads the item box summary after an in-memory mutation.
+  fn refresh_target_items(&mut self) {
+    let read = self
+      .target
+      .as_ref()
+      .map(|opened| edit::read_item_box(opened.document.payload()));
+    let items: Vec<(u32, u32)> = match read {
+      Some(Ok(entries)) => entries.into_iter().map(|entry| (entry.id, entry.num)).collect(),
+      _ => return,
+    };
+    let len = items.len();
+    if let Some(opened) = self.target.as_mut() {
+      opened.box_items = items;
+    }
+    self.box_edits = vec![String::new(); len];
     self.dirty = true;
-    Ok(message)
+  }
+
+  /// Snapshots the opened save and hands it to the worker to write as a new
+  /// file next to the original.
+  fn save_target_to_new_file(&mut self, ui: &egui::Ui) {
+    let Some(opened) = self.target.as_ref() else {
+      return;
+    };
+    let output = derived_output(&opened.path, "edited");
+    if output == opened.path {
+      self.log_line("✘ 输出路径与源文件相同;源存档永远不会被修改");
+      return;
+    }
+    let snapshot = Box::new(OpenedSave {
+      path: opened.path.clone(),
+      document: opened.document.clone(),
+      hunter_name: opened.hunter_name.clone(),
+      box_items: opened.box_items.clone(),
+    });
+    self.spawn(ui.ctx(), WorkerTask::Save { document: snapshot, output });
   }
 }
 
@@ -450,12 +534,19 @@ impl eframe::App for GuiApp {
       ui.add_space(4.0);
       self.show_tab_bar(ui);
       ui.add_space(4.0);
-      egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| match self.tab {
-        TAB_INFO => self.show_info_tab(ui),
-        TAB_PLAYER => self.show_player_tab(ui),
-        TAB_ITEMBOX => self.show_itembox_tab(ui),
-        TAB_TRANSFER => self.show_transfer_tab(ui),
-        _ => self.show_help_tab(ui),
+      // Reserve room for the save bar and log below; without an explicit cap
+      // the tab content claims every remaining pixel and pushes the save
+      // button out of the visible area.
+      let bottom_reserve = 180.0;
+      let content_height = (ui.available_height() - bottom_reserve).max(120.0);
+      egui::ScrollArea::vertical().auto_shrink(false).max_height(content_height).show(ui, |ui| {
+        match self.tab {
+          TAB_INFO => self.show_info_tab(ui),
+          TAB_PLAYER => self.show_player_tab(ui),
+          TAB_ITEMBOX => self.show_itembox_tab(ui),
+          TAB_TRANSFER => self.show_transfer_tab(ui),
+          _ => self.show_help_tab(ui),
+        }
       });
 
       ui.add_space(6.0);
@@ -666,9 +757,15 @@ impl GuiApp {
       let ready = !self.busy && steamid.is_ok() && self.target.is_some();
       if ui.add_enabled(ready, egui::Button::new("应用数值修改")).clicked() {
         match self.apply_player_edits() {
-          Ok(()) => self.log_line("✔ 数值修改已应用 (内存中,记得“保存为新文件”)"),
+          Ok(()) => self.log_line("✔ 数值修改已应用 (内存中)"),
           Err(error) => self.log_line(&format!("✘ {error}")),
         }
+      }
+      if ui
+        .add_enabled(!self.busy && self.target.is_some(), egui::Button::new("保存为新文件"))
+        .clicked()
+      {
+        self.save_target_to_new_file(ui);
       }
       ui.label("(留空 = 不修改该值;名称当前为只读)");
     });
@@ -690,6 +787,15 @@ impl GuiApp {
           Ok(text) => self.log_line(&format!("✔ 道具修改已应用: {text} (内存中)")),
           Err(error) => self.log_line(&format!("✘ {error}")),
         }
+      }
+      if ui
+        .add_enabled(!self.busy && self.target.is_some(), egui::Button::new("保存为新文件"))
+        .clicked()
+      {
+        self.save_target_to_new_file(ui);
+      }
+      if self.dirty {
+        ui.label(egui::RichText::new("● 有未保存修改").color(egui::Color32::LIGHT_YELLOW));
       }
     });
     if self.box_edits.len() != self.box_items_len() {
@@ -736,8 +842,35 @@ impl GuiApp {
   }
 
   fn show_transfer_tab(&mut self, ui: &mut egui::Ui) {
-    ui.label("把“来源存档”的道具/装备合并进“目标存档”(同一 Steam 账号,先各自打开):");
+    if self.target.is_none() {
+      ui.label("先用顶部“快速选择”或“浏览…”选定目标存档并点“打开存档”,再进行转移。");
+      return;
+    }
+    ui.label("把“来源存档”的数据合并进“目标存档”(同一 Steam 账号):");
     ui.add_space(4.0);
+    ui.horizontal(|ui| {
+      ui.label("来源快速选择");
+      let selected = self
+        .discovered
+        .iter()
+        .find(|(path, _, _)| path.display().to_string() == self.source_path)
+        .map(|(_, label, _)| label.clone())
+        .unwrap_or_else(|| "(未选择)".to_owned());
+      egui::ComboBox::from_id_salt("discovered-sources").selected_text(selected).show_ui(ui, |ui| {
+        for (path, label, account) in &self.discovered {
+          if ui.selectable_value(&mut self.source_path, path.display().to_string(), label).clicked()
+            && let Some(account) = account
+          {
+            // The save folder name is the 32-bit account id; derive the
+            // SteamID64 automatically so users never have to look it up.
+            self.steamid64 = steamid64_from_account(*account).to_string();
+            let note = format!("已根据存档路径自动填入 SteamID64: {}\n", self.steamid64);
+            self.log.push_str(&note);
+          }
+        }
+      });
+      ui.label("(与目标相同则无需转移)");
+    });
     Grid::new("transfer").num_columns(3).spacing([8.0, 6.0]).show(ui, |ui| {
       ui.label("来源存档");
       ui.add_sized([420.0, 20.0], egui::TextEdit::singleline(&mut self.source_path));
@@ -756,7 +889,6 @@ impl GuiApp {
       let open_ready = !self.busy
         && steamid.is_ok()
         && !self.source_path.trim().is_empty()
-        && self.target.is_some()
         && self.source.is_none();
       if ui.add_enabled(open_ready, egui::Button::new("打开来源存档")).clicked() {
         let task = WorkerTask::Open {
@@ -766,34 +898,75 @@ impl GuiApp {
         };
         self.spawn(ui.ctx(), task);
       }
-      let both_ready = !self.busy && self.target.is_some() && self.source.is_some();
-      if ui.add_enabled(both_ready, egui::Button::new("转移道具箱")).clicked() {
-        match self.transfer(false) {
-          Ok(text) => self.log_line(&format!("✔ {text} (内存中)")),
-          Err(error) => self.log_line(&format!("✘ {error}")),
-        }
-      }
-      if ui.add_enabled(both_ready, egui::Button::new("转移装备+护石+组合")).clicked() {
-        match self.transfer(true) {
-          Ok(text) => self.log_line(&format!("✔ {text} (内存中)")),
-          Err(error) => self.log_line(&format!("✘ {error}")),
-        }
-      }
-      let source_note = self
-        .source
-        .as_ref()
-        .map(|source| format!("来源: {} ({})", source.path.display(), source.summary()));
       if self.source.is_some()
         && ui.add_enabled(!self.busy, egui::Button::new("卸载来源存档")).clicked()
       {
         self.source = None;
         self.log_line("已卸载来源存档");
       }
-      if let Some(note) = source_note {
-        ui.label(note);
+      if let Some(source) = &self.source {
+        ui.label(format!("来源: {} ({})", source.path.display(), source.summary()));
       }
     });
-    ui.label("转移在内存中立即生效;确认无误后用底部“保存为新文件”写盘。");
+
+    ui.add_space(6.0);
+    ui.separator();
+    ui.heading("道具箱转移");
+    ui.horizontal(|ui| {
+      ui.label("取自来源的类别:");
+      for ((label, _), on) in ITEM_CATEGORY_GROUPS.iter().zip(&mut self.xfer_cats) {
+        ui.checkbox(on, *label);
+      }
+      if ui.small_button("全选").clicked() {
+        self.xfer_cats.iter_mut().for_each(|on| *on = true);
+      }
+      if ui.small_button("清空").clicked() {
+        self.xfer_cats.iter_mut().for_each(|on| *on = false);
+      }
+    });
+    ui.horizontal(|ui| {
+      let both_ready = !self.busy && self.source.is_some();
+      let any_cat = self.xfer_cats.iter().any(|on| *on);
+      if ui
+        .add_enabled(both_ready && any_cat, egui::Button::new("转移道具箱 (按类别合并)"))
+        .clicked()
+      {
+        match self.transfer_items_filtered() {
+          Ok(text) => self.log_line(&format!("✔ {text} (内存中)")),
+          Err(error) => self.log_line(&format!("✘ {error}")),
+        }
+      }
+      ui.label("仅勾选类别的槽位取自来源,其余保留目标原样;全部勾选 = 完整替换");
+    });
+
+    ui.add_space(6.0);
+    ui.separator();
+    ui.heading("装备转移");
+    ui.horizontal(|ui| {
+      ui.checkbox(&mut self.xfer_equip_box, "装备箱 (武器/防具/护石)");
+      ui.checkbox(&mut self.xfer_equip_manager, "穿着与装备组合登记");
+      ui.checkbox(&mut self.xfer_item_my_set, "道具袋组合");
+    });
+    ui.horizontal(|ui| {
+      let both_ready = !self.busy && self.source.is_some();
+      let any_part = self.xfer_equip_box || self.xfer_equip_manager || self.xfer_item_my_set;
+      if ui
+        .add_enabled(both_ready && any_part, egui::Button::new("转移装备 (按所选组件)"))
+        .clicked()
+      {
+        match self.transfer_equipment_selected() {
+          Ok(text) => self.log_line(&format!("✔ {text} (内存中)")),
+          Err(error) => self.log_line(&format!("✘ {error}")),
+        }
+      }
+    });
+    if !(self.xfer_equip_box && self.xfer_equip_manager && self.xfer_item_my_set) {
+      ui.colored_label(
+        egui::Color32::LIGHT_YELLOW,
+        "⚠ 部分转移时,装备组合/穿着引用的装备箱序号可能对应不同装备,进游戏后请先检查",
+      );
+    }
+    ui.label("转移在内存中立即生效;确认无误后用下方“保存为新文件”写盘。");
   }
 
   fn show_help_tab(&mut self, ui: &mut egui::Ui) {

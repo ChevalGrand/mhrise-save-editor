@@ -51,6 +51,54 @@ pub struct EquipmentTransferReport {
   pub box_used: usize,
 }
 
+/// Which equipment classes a partial transfer copies. Selecting a subset can
+/// leave the target's index references (`PlEquipPack` box indices, loadout
+/// registers) pointing into a box that no longer holds the same pieces — the
+/// game tolerates this, but registered sets then resolve to different gear.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EquipParts {
+  /// `snow.data.EquipBox` — stored weapons, armor, talismans.
+  pub equip_box: bool,
+  /// `snow.data.EquipDataManager.SaveData1` — worn pack, loadout registers,
+  /// hunter sets.
+  pub equip_manager: bool,
+  /// `snow.data.ItemMySet` — the 40 item pouch loadouts.
+  pub item_my_set: bool,
+}
+
+impl Default for EquipParts {
+  fn default() -> Self {
+    Self { equip_box: true, equip_manager: true, item_my_set: true }
+  }
+}
+
+impl EquipParts {
+  pub fn all() -> Self {
+    Self::default()
+  }
+
+  pub fn none() -> Self {
+    Self { equip_box: false, equip_manager: false, item_my_set: false }
+  }
+
+  fn any(self) -> bool {
+    self.equip_box || self.equip_manager || self.item_my_set
+  }
+}
+
+/// Per-slot item box merge result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MergeReport {
+  /// Total slots in the box (target and source must agree).
+  pub slots: usize,
+  /// Slots taken from the source (item passed the filter).
+  pub transferred: usize,
+  /// Slots left as the target had them.
+  pub kept: usize,
+  /// Non-empty slots in the source box.
+  pub source_items: usize,
+}
+
 /// Transfers the whole equipment complex from source to target:
 ///
 /// - `snow.data.EquipBox` — stored weapons, armor, talismans (with skills,
@@ -68,11 +116,30 @@ pub fn transfer_equipment(
   target: &mut SavePayload,
   source: &SavePayload,
 ) -> Result<EquipmentTransferReport> {
-  let classes = vec![
-    ("EquipBox", copy_class_fields(target, source, EQUIP_BOX_CLASS)?),
-    ("EquipManager", copy_class_fields(target, source, EQUIP_MANAGER_SAVE_CLASS)?),
-    ("ItemMySet", copy_class_fields(target, source, ITEM_MY_SET_CLASS)?),
-  ];
+  transfer_equipment_parts(target, source, EquipParts::all())
+}
+
+/// Transfers only the selected equipment classes. See `transfer_equipment`
+/// for the full-complex copy; partial copies can leave index references
+/// pointing at different box contents.
+pub fn transfer_equipment_parts(
+  target: &mut SavePayload,
+  source: &SavePayload,
+  parts: EquipParts,
+) -> Result<EquipmentTransferReport> {
+  if !parts.any() {
+    bail!("no equipment components selected; nothing to transfer");
+  }
+  let mut classes = Vec::new();
+  if parts.equip_box {
+    classes.push(("EquipBox", copy_class_fields(target, source, EQUIP_BOX_CLASS)?));
+  }
+  if parts.equip_manager {
+    classes.push(("EquipManager", copy_class_fields(target, source, EQUIP_MANAGER_SAVE_CLASS)?));
+  }
+  if parts.item_my_set {
+    classes.push(("ItemMySet", copy_class_fields(target, source, ITEM_MY_SET_CLASS)?));
+  }
 
   let mut boxes = Vec::new();
   collect_classes(target, EQUIP_BOX_CLASS, &mut boxes);
@@ -304,6 +371,119 @@ pub fn transfer_item_box(target: &mut SavePayload, source: &SavePayload) -> Resu
   }
   match replaced {
     1 => Ok(TransferReport { slots, items }),
+    0 => bail!("no item box (_InventoryList) found in the target save"),
+    many => bail!("found {many} item box inventories in the target save; expected exactly one"),
+  }
+}
+
+/// The item id stored in one item box slot (`ItemInventoryData._ItemCount._Id`).
+fn slot_item_id(slot: &ArrayValue) -> Option<u32> {
+  let ArrayValue::Class(class) = slot else {
+    return None;
+  };
+  for field in &class.fields {
+    if field.hash != ITEM_INVENTORY_COUNT {
+      continue;
+    }
+    let FieldValue::Class(count) = &field.value else {
+      return None;
+    };
+    for number_field in &count.fields {
+      if number_field.hash != ITEM_COUNT_ID {
+        continue;
+      }
+      if let FieldValue::Scalar { bytes, .. } = &number_field.value {
+        return Some(u32::from_le_bytes(bytes.as_slice().try_into().ok()?));
+      }
+    }
+  }
+  None
+}
+
+/// Merge variant of [`transfer_item_box`]: only slots whose source item
+/// passes `keep` are copied; everything else keeps the target's contents.
+/// Both boxes must have the same slot count (the game allocates a fixed
+/// 1800), matching the layout check `transfer_item_box` performs.
+pub fn transfer_item_box_filtered(
+  target: &mut SavePayload,
+  source: &SavePayload,
+  keep: impl Fn(u32) -> bool,
+) -> Result<MergeReport> {
+  let source_array = find_inventory_list(source)?;
+
+  fn merge_in_class(
+    class: &mut Class,
+    source_array: &Array,
+    keep: &impl Fn(u32) -> bool,
+    transferred: &mut usize,
+    merged_boxes: &mut usize,
+    slots: &mut usize,
+  ) -> Result<()> {
+    let class_hash = class.hash;
+    for field in &mut class.fields {
+      if class_hash == ITEM_BOX_CLASS && field.hash == ITEM_BOX_INVENTORY_LIST {
+        if let FieldValue::Array(target_array) = &mut field.value {
+          if source_array.member_type != target_array.member_type
+            || source_array.member_size != target_array.member_size
+            || source_array.array_type != target_array.array_type
+          {
+            bail!("source and target item boxes have different array layouts; refusing to transfer");
+          }
+          if source_array.values.len() != target_array.values.len() {
+            bail!(
+              "source box has {} slots but target has {}; game versions may differ",
+              source_array.values.len(),
+              target_array.values.len()
+            );
+          }
+          *slots = target_array.values.len();
+          for (target_slot, source_slot) in
+            target_array.values.iter_mut().zip(&source_array.values)
+          {
+            if slot_item_id(source_slot).is_some_and(|id| keep(id)) {
+              *target_slot = source_slot.clone();
+              *transferred += 1;
+            }
+          }
+          *merged_boxes += 1;
+          continue;
+        }
+      }
+      match &mut field.value {
+        FieldValue::Class(nested) => {
+          merge_in_class(nested, source_array, keep, transferred, merged_boxes, slots)?
+        }
+        FieldValue::Array(array) => {
+          for element in &mut array.values {
+            if let ArrayValue::Class(nested) = element {
+              merge_in_class(nested, source_array, keep, transferred, merged_boxes, slots)?;
+            }
+          }
+        }
+        _ => {}
+      }
+    }
+    Ok(())
+  }
+
+  let mut transferred = 0usize;
+  let mut merged_boxes = 0usize;
+  let mut slots = 0usize;
+  for entry in &mut target.entries {
+    merge_in_class(
+      &mut entry.class,
+      source_array,
+      &keep,
+      &mut transferred,
+      &mut merged_boxes,
+      &mut slots,
+    )?;
+  }
+  match merged_boxes {
+    1 => {
+      let source_items = count_nonempty_slots(source_array);
+      Ok(MergeReport { slots, transferred, kept: slots - transferred, source_items })
+    }
     0 => bail!("no item box (_InventoryList) found in the target save"),
     many => bail!("found {many} item box inventories in the target save; expected exactly one"),
   }
@@ -800,6 +980,69 @@ mod tests {
     let _ = item_slot(0, 0);
   }
 
+  #[test]
+  fn merge_transfer_copies_only_slots_passing_the_filter() {
+    // Source: 回复药 x10, 回复药G x5; target keeps 回复药G, takes 回复药.
+    let source = box_payload(vec![item_slot(0x0410_0006, 10), item_slot(0x0410_0007, 5)]);
+    let mut target = box_payload(vec![item_slot(0x0410_0006, 1), item_slot(0x0410_0007, 2)]);
+    let report = transfer_item_box_filtered(&mut target, &source, |id| id == 0x0410_0006)
+      .expect("merge should succeed");
+    assert_eq!(report.slots, 2);
+    assert_eq!(report.transferred, 1);
+    assert_eq!(report.kept, 1);
+    assert_eq!(report.source_items, 2);
+
+    let entries = read_item_box(&target).expect("read merged box");
+    assert_eq!(entries[0], ItemBoxEntry { id: 0x0410_0006, num: 10 });
+    assert_eq!(entries[1], ItemBoxEntry { id: 0x0410_0007, num: 2 });
+  }
+
+  #[test]
+  fn merge_transfer_rejects_mismatched_slot_counts() {
+    let source = box_payload(vec![item_slot(1, 1), item_slot(2, 2)]);
+    let mut target = box_payload(vec![item_slot(1, 1)]);
+    let error = transfer_item_box_filtered(&mut target, &source, |_| true)
+      .expect_err("slot count mismatch must fail");
+    assert!(
+      error.to_string().contains("2 slots but target has 1"),
+      "unexpected error: {error}"
+    );
+  }
+
+  #[test]
+  fn equipment_transfer_can_be_restricted_to_selected_components() {
+    let source = equip_complex_payload(777, 3);
+    let mut target = equip_complex_payload(0, 0);
+
+    // Box only: the manager class keeps the target's values.
+    let report = transfer_equipment_parts(&mut target, &source, EquipParts {
+      equip_box: true,
+      equip_manager: false,
+      item_my_set: false,
+    })
+    .expect("box-only transfer should succeed");
+    assert_eq!(report.classes.len(), 1);
+    assert_eq!(report.classes[0].0, "EquipBox");
+
+    let mut managers = Vec::new();
+    collect_classes(&target, EQUIP_MANAGER_SAVE_CLASS, &mut managers);
+    assert_eq!(managers.len(), 1);
+    // The untouched manager still has the target's worn index.
+    let FieldValue::Class(pack) = &managers[0].fields[0].value else {
+      panic!("expected nested pack class");
+    };
+    let FieldValue::Scalar { bytes, .. } = &pack.fields[0].value else {
+      panic!("expected scalar");
+    };
+    assert_eq!(bytes.as_slice(), 0i32.to_le_bytes());
+
+    // Nothing selected: refused.
+    let mut fresh = equip_complex_payload(0, 0);
+    let error = transfer_equipment_parts(&mut fresh, &source, EquipParts::none())
+      .expect_err("empty selection must fail");
+    assert!(error.to_string().contains("no equipment components"), "unexpected: {error}");
+  }
+
   fn equip_complex_payload(id_val: u32, worn_index: i32) -> SavePayload {
     use crate::payload::Array;
     let inventory_array = Array {
@@ -825,6 +1068,18 @@ mod tests {
         value: FieldValue::Scalar { size: 4, bytes: worn_index.to_le_bytes().to_vec() },
       }],
     };
+    let equip_manager = Class {
+      hash: EQUIP_MANAGER_SAVE_CLASS,
+      fields: vec![Field {
+        hash: 0x6,
+        field_type: 0x11,
+        value: FieldValue::Class(Box::new(equip_pack)),
+      }],
+    };
+    let item_my_set = Class {
+      hash: ITEM_MY_SET_CLASS,
+      fields: vec![Field { hash: 0x7, field_type: 0x07, value: scalar(0) }],
+    };
     SavePayload {
       entries: vec![crate::payload::NativeClass {
         native_hash: 0x1,
@@ -832,7 +1087,8 @@ mod tests {
           hash: 0x2,
           fields: vec![
             Field { hash: 0x5, field_type: 0x11, value: FieldValue::Class(Box::new(equip_box)) },
-            Field { hash: 0x6, field_type: 0x11, value: FieldValue::Class(Box::new(equip_pack)) },
+            Field { hash: 0x8, field_type: 0x11, value: FieldValue::Class(Box::new(equip_manager)) },
+            Field { hash: 0x9, field_type: 0x11, value: FieldValue::Class(Box::new(item_my_set)) },
           ],
         },
       }],
