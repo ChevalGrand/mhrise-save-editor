@@ -36,6 +36,15 @@ pub const ITEM_ID_NONE: u32 = 0x0400_0000;
 pub const EQUIP_BOX_CLASS: u32 = 0xf050_9899;
 /// `snow.data.EquipDataManager.SaveData1` — worn pack, loadouts, hunter sets.
 pub const EQUIP_MANAGER_SAVE_CLASS: u32 = 0x960b_aed3;
+/// `EquipDataManager.SaveData1._PlEquipMySetList` — the 224 装备组合.
+pub const EQUIP_MY_SET_LIST: u32 = 0xb4ab_1a25;
+/// `PlEquipMySetData._IsUsing`.
+pub const EQUIP_MYSET_IS_USING: u32 = 0x26fc_8108;
+/// `PlEquipMySetData._Name`.
+pub const EQUIP_MYSET_NAME: u32 = 0xbcf6_bc33;
+/// `PlEquipMySetData._InventoryIndexList` — the equipment box indices the
+/// loadout references (weapon + armor + talisman).
+pub const EQUIP_MYSET_INVENTORY_INDEX_LIST: u32 = 0x466e_52be;
 /// `snow.data.ItemMySet` — registered item pouch loadouts.
 pub const ITEM_MY_SET_CLASS: u32 = 0x8923_cd68;
 /// `snow.data.EquipmentInventoryData._IdVal` — the equipment piece id.
@@ -158,6 +167,331 @@ pub fn set_guild_flags(payload: &mut SavePayload, values: &[(u32, bool)]) -> Res
     bail!("self guild card not found; refusing to write unlock flags");
   }
   Ok(updated)
+}
+
+/// One 装备组合 register from `_PlEquipMySetList`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EquipLoadout {
+  /// Slot number in the 224-entry list.
+  pub index: usize,
+  pub name: String,
+  pub is_using: bool,
+  /// Equipment box indices referenced by the loadout (`_InventoryIndexList`).
+  pub inventory_indices: Vec<u32>,
+}
+
+/// Reads all 224 装备组合 registers from the target's EquipDataManager.
+pub fn read_equip_loadouts(payload: &SavePayload) -> Vec<EquipLoadout> {
+  let mut managers = Vec::new();
+  collect_classes(payload, EQUIP_MANAGER_SAVE_CLASS, &mut managers);
+  let Some(manager) = managers.first() else {
+    return Vec::new();
+  };
+  let Some(FieldValue::Array(list)) =
+    manager.fields.iter().find(|field| field.hash == EQUIP_MY_SET_LIST).map(|field| &field.value)
+  else {
+    return Vec::new();
+  };
+  list
+    .values
+    .iter()
+    .enumerate()
+    .filter_map(|(index, element)| {
+      let ArrayValue::Class(class) = element else {
+        return None;
+      };
+      let name = class.fields.iter().find(|field| field.hash == EQUIP_MYSET_NAME).and_then(
+        |field| match &field.value {
+          FieldValue::String(units) => Some(String::from_utf16_lossy(units)),
+          _ => None,
+        },
+      )?;
+      let is_using = class
+        .fields
+        .iter()
+        .find(|field| field.hash == EQUIP_MYSET_IS_USING)
+        .and_then(|field| match &field.value {
+          FieldValue::Scalar { bytes, size: 1 } if !bytes.is_empty() => Some(bytes[0] != 0),
+          _ => None,
+        })
+        .unwrap_or(false);
+      let mut inventory_indices = Vec::new();
+      if let Some(field) = class.fields.iter().find(|field| field.hash == EQUIP_MYSET_INVENTORY_INDEX_LIST)
+        && let FieldValue::Array(indices) = &field.value
+      {
+        for element in &indices.values {
+          if let ArrayValue::Scalar(bytes) = element
+            && bytes.len() == 4
+          {
+            inventory_indices.push(i32::from_le_bytes(bytes.as_slice().try_into().expect("4 bytes")) as u32);
+          }
+        }
+      }
+      Some(EquipLoadout { index, name, is_using, inventory_indices })
+    })
+    .collect()
+}
+
+/// Copies one 装备组合 register from the source to a slot in the target.
+/// With `include_equipment`, every equipment box piece the loadout references
+/// is copied source→target at the same box index, so the register keeps
+/// pointing at the intended pieces. Returns the target slot used.
+fn equip_my_set_list(payload: &SavePayload) -> Result<&Array> {
+  let mut managers = Vec::new();
+  collect_classes(payload, EQUIP_MANAGER_SAVE_CLASS, &mut managers);
+  let manager = managers.first().ok_or_else(|| anyhow::anyhow!("no EquipDataManager in save"))?;
+  match manager.fields.iter().find(|field| field.hash == EQUIP_MY_SET_LIST).map(|field| &field.value) {
+    Some(FieldValue::Array(array)) => Ok(array),
+    _ => bail!("EquipDataManager has no _PlEquipMySetList array"),
+  }
+}
+
+/// Number of `_field_hash` arrays inside `class_hash` instances.
+fn count_field_arrays(payload: &SavePayload, class_hash: u32, field_hash: u32) -> usize {
+  fn count(class: &Class, class_hash: u32, field_hash: u32, out: &mut usize) {
+    if class.hash == class_hash && class.fields.iter().any(|field| field.hash == field_hash) {
+      *out += 1;
+    }
+    for field in &class.fields {
+      match &field.value {
+        FieldValue::Class(nested) => count(nested, class_hash, field_hash, out),
+        FieldValue::Array(array) => {
+          for element in &array.values {
+            if let ArrayValue::Class(nested) = element {
+              count(nested, class_hash, field_hash, out);
+            }
+          }
+        }
+        _ => {}
+      }
+    }
+  }
+  let mut out = 0;
+  for entry in &payload.entries {
+    count(&entry.class, class_hash, field_hash, &mut out);
+  }
+  out
+}
+
+/// Recursively replaces `element_index` of the array stored at
+/// (`class_hash`, `field_hash`) with `replacement`, on every matching
+/// instance (callers verify there is exactly one).
+fn replace_list_element(
+  payload: &mut SavePayload,
+  class_hash: u32,
+  field_hash: u32,
+  element_index: usize,
+  replacement: &ArrayValue,
+) -> Result<()> {
+  fn rec(
+    class: &mut Class,
+    class_hash: u32,
+    field_hash: u32,
+    element_index: usize,
+    replacement: &ArrayValue,
+    matched: &mut usize,
+  ) -> Result<()> {
+    let class_hash_here = class.hash;
+    for field in &mut class.fields {
+      if class_hash_here == class_hash && field.hash == field_hash {
+        if let FieldValue::Array(array) = &mut field.value {
+          if element_index >= array.values.len() {
+            bail!("element index {element_index} out of range ({} slots)", array.values.len());
+          }
+          array.values[element_index] = replacement.clone();
+          *matched += 1;
+          continue;
+        }
+      }
+      match &mut field.value {
+        FieldValue::Class(nested) => {
+          rec(nested, class_hash, field_hash, element_index, replacement, matched)?
+        }
+        FieldValue::Array(array) => {
+          for element in &mut array.values {
+            if let ArrayValue::Class(nested) = element {
+              rec(nested, class_hash, field_hash, element_index, replacement, matched)?;
+            }
+          }
+        }
+        _ => {}
+      }
+    }
+    Ok(())
+  }
+  let mut matched = 0;
+  for entry in &mut payload.entries {
+    rec(&mut entry.class, class_hash, field_hash, element_index, replacement, &mut matched)?;
+  }
+  if matched == 0 {
+    bail!("no array at (class {class_hash:08x}, field {field_hash:08x})");
+  }
+  Ok(())
+}
+
+/// Recursively applies `copy` to the equipment box array of the target
+/// payload. `source_slots` is the source box's slot count for the
+/// length check.
+fn with_box_array(
+  target: &mut SavePayload,
+  source_slots: usize,
+  copy: &mut impl FnMut(&mut Array) -> Result<()>,
+) -> Result<()> {
+  fn rec(
+    class: &mut Class,
+    source_slots: usize,
+    copy: &mut impl FnMut(&mut Array) -> Result<()>,
+    matched: &mut usize,
+  ) -> Result<()> {
+    let class_hash_here = class.hash;
+    for field in &mut class.fields {
+      if class_hash_here == EQUIP_BOX_CLASS && field.hash == EQUIP_BOX_WEAPON_ARMOR_LIST {
+        if let FieldValue::Array(array) = &mut field.value {
+          if source_slots != array.values.len() {
+            bail!("equipment box slot count differs between saves");
+          }
+          copy(array)?;
+          *matched += 1;
+          continue;
+        }
+      }
+      match &mut field.value {
+        FieldValue::Class(nested) => rec(nested, source_slots, copy, matched)?,
+        FieldValue::Array(array) => {
+          for element in &mut array.values {
+            if let ArrayValue::Class(nested) = element {
+              rec(nested, source_slots, copy, matched)?;
+            }
+          }
+        }
+        _ => {}
+      }
+    }
+    Ok(())
+  }
+  let mut matched = 0;
+  for entry in &mut target.entries {
+    rec(&mut entry.class, source_slots, copy, &mut matched)?;
+  }
+  if matched == 0 {
+    bail!("no EquipBox _WeaponArmorInventoryList array in the target save");
+  }
+  Ok(())
+}
+
+fn equip_armor_list(payload: &SavePayload) -> Result<&Array> {
+  let mut boxes = Vec::new();
+  collect_classes(payload, EQUIP_BOX_CLASS, &mut boxes);
+  let box_class = boxes.first().ok_or_else(|| anyhow::anyhow!("no EquipBox in save"))?;
+  match box_class
+    .fields
+    .iter()
+    .find(|field| field.hash == EQUIP_BOX_WEAPON_ARMOR_LIST)
+    .map(|field| &field.value)
+  {
+    Some(FieldValue::Array(array)) => Ok(array),
+    _ => bail!("EquipBox has no _WeaponArmorInventoryList array"),
+  }
+}
+
+fn inventory_indices_of(element: &ArrayValue) -> Vec<u32> {
+  let ArrayValue::Class(class) = element else {
+    return Vec::new();
+  };
+  let Some(FieldValue::Array(indices)) =
+    class.fields.iter().find(|field| field.hash == EQUIP_MYSET_INVENTORY_INDEX_LIST).map(|field| &field.value)
+  else {
+    return Vec::new();
+  };
+  indices
+    .values
+    .iter()
+    .filter_map(|element| match element {
+      ArrayValue::Scalar(bytes) if bytes.len() == 4 => {
+        Some(u32::from_le_bytes(bytes.as_slice().try_into().expect("4 bytes")))
+      }
+      _ => None,
+    })
+    .collect()
+}
+
+/// Copies one 装备组合 register from the source to a slot in the target.
+/// With `include_equipment`, every equipment box piece the loadout references
+/// is copied source→target at the same box index, so the register keeps
+/// pointing at the intended pieces. Returns the target slot used.
+pub fn copy_equip_loadout(
+  target: &mut SavePayload,
+  source: &SavePayload,
+  source_index: usize,
+  target_index: Option<usize>,
+  include_equipment: bool,
+) -> Result<usize> {
+  if count_field_arrays(target, EQUIP_MANAGER_SAVE_CLASS, EQUIP_MY_SET_LIST) != 1 {
+    bail!("target must contain exactly one _PlEquipMySetList");
+  }
+  let source_element = {
+    let list = equip_my_set_list(source)?;
+    if source_index >= list.values.len() {
+      bail!("source loadout index {source_index} out of range ({} slots)", list.values.len());
+    }
+    list.values[source_index].clone()
+  };
+  let referenced_indices = inventory_indices_of(&source_element);
+
+  let target_slot = match target_index {
+    Some(slot) => slot,
+    None => {
+      let loadouts = read_equip_loadouts(target);
+      loadouts
+        .iter()
+        .find(|loadout| !loadout.is_using)
+        .map(|loadout| loadout.index)
+        .ok_or_else(|| anyhow::anyhow!("target has no free loadout slot; specify a slot to overwrite"))?
+    }
+  };
+
+  if include_equipment {
+    let source_box = equip_armor_list(source)?;
+    let source_slots = source_box.values.len();
+    let indices = referenced_indices.clone();
+    with_box_array(target, source_slots, &mut |target_box| {
+      for &box_index in &indices {
+        let index = box_index as usize;
+        if index < target_box.values.len() {
+          target_box.values[index] = source_box.values[index].clone();
+        }
+      }
+      Ok(())
+    })?;
+  }
+
+  replace_list_element(target, EQUIP_MANAGER_SAVE_CLASS, EQUIP_MY_SET_LIST, target_slot, &source_element)?;
+  Ok(target_slot)
+}
+
+/// Copies a single equipment piece between box slots: source box
+/// `source_index` is written to target box `target_index`.
+pub fn copy_equip_piece(
+  target: &mut SavePayload,
+  source: &SavePayload,
+  source_index: usize,
+  target_index: usize,
+) -> Result<()> {
+  let source_value = {
+    let source_box = equip_armor_list(source)?;
+    source_box.values.get(source_index).cloned().ok_or_else(|| {
+      anyhow::anyhow!("source box index {source_index} out of range ({} slots)", source_box.values.len())
+    })?
+  };
+  let source_slots = equip_armor_list(source)?.values.len();
+  with_box_array(target, source_slots, &mut |target_box| {
+    if target_index >= target_box.values.len() {
+      bail!("target box index {target_index} out of range ({} slots)", target_box.values.len());
+    }
+    target_box.values[target_index] = source_value.clone();
+    Ok(())
+  })?;
+  Ok(())
 }
 
 /// The three progression ranks, from `ProgressSaveData`.
@@ -1527,4 +1861,181 @@ mod tests {
       set_item_counts(&mut payload, &[(0x0410_0200, 1)]).expect_err("no empty slot must fail");
     assert!(error.to_string().contains("full"), "unexpected error: {error}");
   }
+  fn loadout_element(name: &str, is_using: bool, indices: &[u32]) -> crate::payload::ArrayValue {
+    use crate::payload::Array;
+    let index_array = Array {
+      member_type: 0x04,
+      member_size: 4,
+      array_type: 0,
+      class_hashes: None,
+      values: indices.iter().map(|index| ArrayValue::Scalar(index.to_le_bytes().to_vec())).collect(),
+    };
+    ArrayValue::Class(Box::new(Class {
+      hash: 0xd897_238a, // snow.equip.PlEquipMySetData
+      fields: vec![
+        Field { hash: EQUIP_MYSET_IS_USING, field_type: 0x01, value: FieldValue::Scalar { size: 1, bytes: vec![u8::from(is_using)] } },
+        Field { hash: EQUIP_MYSET_NAME, field_type: 0x0f, value: FieldValue::String(name.encode_utf16().collect()) },
+        Field { hash: EQUIP_MYSET_INVENTORY_INDEX_LIST, field_type: -1, value: FieldValue::Array(index_array) },
+      ],
+    }))
+  }
+
+  /// EquipDataManager with a 4-slot loadout list + an 8-slot equipment box.
+  fn loadout_payload(loadouts: Vec<crate::payload::ArrayValue>) -> SavePayload {
+    use crate::payload::Array;
+    let mut loadout_values = loadouts;
+    while loadout_values.len() < 4 {
+      loadout_values.push(loadout_element("(free)", false, &[]));
+    }
+    let loadout_list = Array {
+      member_type: 0x11,
+      member_size: 0,
+      array_type: 1,
+      class_hashes: Some(vec![0xd897_238a; loadout_values.len()]),
+      values: loadout_values,
+    };
+    let manager = Class {
+      hash: EQUIP_MANAGER_SAVE_CLASS,
+      fields: vec![Field {
+        hash: EQUIP_MY_SET_LIST,
+        field_type: -1,
+        value: FieldValue::Array(loadout_list),
+      }],
+    };
+    let mut box_values = Vec::new();
+    for index in 0..8 {
+      box_values.push(equip_entry(1000 + index as u32));
+    }
+    let box_list = Array {
+      member_type: 0x11,
+      member_size: 0,
+      array_type: 1,
+      class_hashes: Some(vec![0xe9f1_0309; box_values.len()]),
+      values: box_values,
+    };
+    let equip_box = Class {
+      hash: EQUIP_BOX_CLASS,
+      fields: vec![Field {
+        hash: EQUIP_BOX_WEAPON_ARMOR_LIST,
+        field_type: -1,
+        value: FieldValue::Array(box_list),
+      }],
+    };
+    SavePayload {
+      entries: vec![crate::payload::NativeClass {
+        native_hash: 0x1,
+        class: Class {
+          hash: 0x2,
+          fields: vec![
+            Field { hash: 0x5, field_type: 0x11, value: FieldValue::Class(Box::new(equip_box)) },
+            Field { hash: 0x8, field_type: 0x11, value: FieldValue::Class(Box::new(manager)) },
+          ],
+        },
+      }],
+    }
+  }
+
+  #[test]
+  fn reads_equip_loadouts_with_names_and_indices() {
+    let payload = loadout_payload(vec![
+      loadout_element("魔狂化双刀雷", true, &[0, 1, 2, 3, 4, 5, 6, 7]),
+      loadout_element("(free)", false, &[]),
+    ]);
+    let loadouts = read_equip_loadouts(&payload);
+    assert_eq!(loadouts.len(), 4);
+    assert_eq!(loadouts[0].index, 0);
+    assert_eq!(loadouts[0].name, "魔狂化双刀雷");
+    assert!(loadouts[0].is_using);
+    assert_eq!(loadouts[0].inventory_indices, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+    assert!(!loadouts[1].is_using);
+  }
+
+  #[test]
+  fn copies_loadout_with_referenced_equipment_to_a_slot() {
+    let source = loadout_payload(vec![loadout_element("魔狂化双刀雷", true, &[0, 1, 2])]);
+    let mut target = loadout_payload(vec![loadout_element("旧组合", true, &[5, 6])]);
+
+    let slot =
+      copy_equip_loadout(&mut target, &source, 0, Some(2), true).expect("loadout copy should succeed");
+    assert_eq!(slot, 2);
+
+    let loadouts = read_equip_loadouts(&target);
+    assert_eq!(loadouts[2].name, "魔狂化双刀雷");
+    assert!(loadouts[2].is_using);
+    assert_eq!(loadouts[2].inventory_indices, vec![0, 1, 2]);
+
+    // Referenced box pieces were copied at the same indices.
+    let box_list = equip_armor_list(&target).expect("box");
+    let piece_id = |index: usize| -> u32 {
+      let crate::payload::ArrayValue::Class(class) = &box_list.values[index] else {
+        panic!("class");
+      };
+      let FieldValue::Scalar { bytes, .. } = &class
+        .fields
+        .iter()
+        .find(|field| field.hash == EQUIP_ID_VAL)
+        .expect("id field")
+        .value
+      else {
+        panic!("scalar");
+      };
+      u32::from_le_bytes(bytes.as_slice().try_into().expect("4 bytes"))
+    };
+    assert_eq!(piece_id(0), 1000); // copied from source
+    assert_eq!(piece_id(1), 1001);
+    assert_eq!(piece_id(2), 1002);
+    assert_eq!(piece_id(5), 1005); // untouched target slot keeps its piece
+    // The overwritten target slot 2 kept its own register contents nowhere —
+    // the old register at slot 0 is still the target's.
+    assert_eq!(loadouts[0].name, "旧组合");
+  }
+
+  #[test]
+  fn copies_loadout_appends_to_the_first_free_slot() {
+    let source = loadout_payload(vec![loadout_element("新组合", true, &[3])]);
+    let mut target = loadout_payload(vec![
+      loadout_element("占用一", true, &[]),
+      loadout_element("(free)", false, &[]),
+      loadout_element("占用二", true, &[]),
+    ]);
+    let slot = copy_equip_loadout(&mut target, &source, 0, None, false).expect("append should succeed");
+    assert_eq!(slot, 1);
+    let loadouts = read_equip_loadouts(&target);
+    assert_eq!(loadouts[1].name, "新组合");
+    assert!(loadouts[1].is_using);
+  }
+
+  #[test]
+  fn copies_a_single_equipment_piece_between_slots() {
+    let source = loadout_payload(vec![]);
+    let mut target = loadout_payload(vec![]);
+    copy_equip_piece(&mut target, &source, 7, 0).expect("piece copy should succeed");
+    let box_list = equip_armor_list(&target).expect("box");
+    let crate::payload::ArrayValue::Class(class) = &box_list.values[0] else {
+      panic!("class");
+    };
+    let FieldValue::Scalar { bytes, .. } = &class
+      .fields
+      .iter()
+      .find(|field| field.hash == EQUIP_ID_VAL)
+      .expect("id field")
+      .value
+    else {
+      panic!("scalar");
+    };
+    assert_eq!(u32::from_le_bytes(bytes.as_slice().try_into().expect("4 bytes")), 1007);
+  }
+
+  #[test]
+  fn copy_equip_piece_rejects_out_of_range_slots() {
+    let source = loadout_payload(vec![]);
+    let mut target = loadout_payload(vec![]);
+    let error =
+      copy_equip_piece(&mut target, &source, 99, 0).expect_err("source range must be enforced");
+    assert!(error.to_string().contains("out of range"), "unexpected: {error}");
+    let error =
+      copy_equip_piece(&mut target, &source, 0, 99).expect_err("target range must be enforced");
+    assert!(error.to_string().contains("out of range"), "unexpected: {error}");
+  }
+
 }

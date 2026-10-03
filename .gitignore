@@ -5,3 +5,9 @@
 !/assets/mhrise/item_names.json
 !/assets/mhrise/item_names_cn.json
 __pycache__/
+
+# local analysis dumps
+equip_s1.json
+rank_s*.json
+verify_s1.json
+smoke_*.json

@@ -22,10 +22,11 @@ use crate::{container::SteamSave, edit, format::parse_header};
 const TAB_INFO: usize = 0;
 const TAB_PLAYER: usize = 1;
 const TAB_ITEMBOX: usize = 2;
-const TAB_TRANSFER: usize = 3;
-const TAB_PROGRESS: usize = 4;
-const TAB_BACKUP: usize = 5;
-const TAB_HELP: usize = 6;
+const TAB_EQUIP: usize = 3;
+const TAB_TRANSFER: usize = 4;
+const TAB_PROGRESS: usize = 5;
+const TAB_BACKUP: usize = 6;
+const TAB_HELP: usize = 7;
 
 /// Loads a single-face CJK .ttf font. egui's text rasterizer (ab_glyph) does
 /// NOT support .ttc collections, which is why msyh.ttc/simsun.ttc cannot be
@@ -133,6 +134,13 @@ pub struct GuiApp {
   guild_flags: Vec<bool>,
   /// Transfer toggle: copy ProgressSaveData (ranks + points).
   xfer_progress: bool,
+  /// 装备组合 tab state: selected source register, target slot text
+  /// (empty = append to the first free slot), and the single-piece inputs.
+  equip_source_combo: usize,
+  equip_target_slot_text: String,
+  equip_with_pieces: bool,
+  equip_piece_source_text: String,
+  equip_piece_target_text: String,
 }
 
 /// (label, item-table categories) groups for the item-box transfer filter.
@@ -733,6 +741,7 @@ impl eframe::App for GuiApp {
           TAB_INFO => self.show_info_tab(ui),
           TAB_PLAYER => self.show_player_tab(ui),
           TAB_ITEMBOX => self.show_itembox_tab(ui),
+          TAB_EQUIP => self.show_equip_tab(ui),
           TAB_TRANSFER => self.show_transfer_tab(ui),
           TAB_PROGRESS => self.show_progress_tab(ui),
           TAB_BACKUP => self.show_backup_tab(ui),
@@ -866,6 +875,7 @@ impl GuiApp {
         (TAB_INFO, "一般信息"),
         (TAB_PLAYER, "玩家数据"),
         (TAB_ITEMBOX, "道具箱编辑"),
+        (TAB_EQUIP, "装备组合"),
         (TAB_TRANSFER, "存档转移"),
         (TAB_PROGRESS, "进度与解禁"),
         (TAB_BACKUP, "备份还原"),
@@ -1052,6 +1062,164 @@ impl GuiApp {
       }
       ui.add_sized([90.0, 18.0], egui::TextEdit::singleline(&mut self.box_edits[index]));
     });
+  }
+
+  fn show_equip_tab(&mut self, ui: &mut egui::Ui) {
+    if self.target.is_none() {
+      ui.label("先用顶部“快速选择”或“浏览…”打开目标存档。");
+      return;
+    }
+    ui.columns(2, |columns| {
+      let mut column_iter = columns.iter_mut();
+      let left = column_iter.next().expect("two columns");
+      let right = column_iter.next().expect("two columns");
+      // Left: the target's own loadout registers.
+      left.heading("目标装备组合 (224 槽)");
+      let loadouts = self
+        .target
+        .as_ref()
+        .map(|opened| edit::read_equip_loadouts(opened.document.payload()))
+        .unwrap_or_default();
+      let used = loadouts.iter().filter(|loadout| loadout.is_using).count();
+      left.label(format!("已登记 {used} 个;组合引用的装备箱槽位在转移时可一并搬运"));
+      egui::ScrollArea::vertical().max_height(360.0).auto_shrink(false).show(left, |ui| {
+        for loadout in &loadouts {
+          ui.horizontal(|ui| {
+            ui.monospace(format!("{:3}", loadout.index));
+            if loadout.is_using {
+              ui.label(&loadout.name);
+            } else {
+              ui.label(egui::RichText::new("(空位)").weak());
+            }
+          });
+        }
+      });
+
+      // Right: transfer controls.
+      right.heading("从来源存档转移");
+      let Some(source) = self.source.as_ref() else {
+        right.label("先在“存档转移”页打开来源存档,才能转移组合/单件装备。");
+        return;
+      };
+      let source_loadouts = edit::read_equip_loadouts(source.document.payload());
+      let using: Vec<&edit::EquipLoadout> =
+        source_loadouts.iter().filter(|loadout| loadout.is_using).collect();
+      if using.is_empty() {
+        right.label("来源存档没有已登记的装备组合。");
+        return;
+      }
+      let selected = self
+        .equip_source_combo
+        .min(using.len().saturating_sub(1));
+      let selected_text = format!("[{}] {}", using[selected].index, using[selected].name);
+      right.label("来源组合:");
+      egui::ComboBox::from_id_salt("equip-source-loadout")
+        .selected_text(selected_text)
+        .width(260.0)
+        .show_ui(right, |ui| {
+          for (choice, loadout) in using.iter().enumerate() {
+            ui.selectable_value(
+              &mut self.equip_source_combo,
+              choice,
+              format!("[{}] {}", loadout.index, loadout.name),
+            );
+          }
+        });
+      right.horizontal(|ui| {
+        ui.label("引用装备:");
+        ui.checkbox(&mut self.equip_with_pieces, "同时搬运组合引用的装备(同槽位覆盖)");
+      });
+      right.horizontal(|ui| {
+        ui.label("目标槽位(留空 = 第一个空位):");
+        ui.add_sized([80.0, 20.0], egui::TextEdit::singleline(&mut self.equip_target_slot_text));
+      });
+      let source_index = using[selected].index;
+      if right
+        .add_enabled(!self.busy, egui::Button::new("转移装备组合"))
+        .clicked()
+      {
+        match self.apply_equip_loadout_transfer(source_index) {
+          Ok(text) => self.log_line(&format!("✔ {text} (内存中)")),
+          Err(error) => self.log_line(&format!("✘ {error}")),
+        }
+      }
+
+      right.add_space(10.0);
+      right.separator();
+      right.heading("单件装备转移");
+      right.horizontal(|ui| {
+        ui.label("来源槽位:");
+        ui.add_sized([70.0, 20.0], egui::TextEdit::singleline(&mut self.equip_piece_source_text));
+        ui.label("目标槽位:");
+        ui.add_sized([70.0, 20.0], egui::TextEdit::singleline(&mut self.equip_piece_target_text));
+      });
+      if right
+        .add_enabled(!self.busy, egui::Button::new("转移单件装备 (目标槽覆盖)"))
+        .clicked()
+      {
+        match self.apply_equip_piece_transfer() {
+          Ok(text) => self.log_line(&format!("✔ {text} (内存中)")),
+          Err(error) => self.log_line(&format!("✘ {error}")),
+        }
+      }
+      right.label("装备以装备箱槽位号定位;覆盖目标槽位前请确认其内容不再需要。");
+    });
+    ui.label("所有转移在内存中立即生效;确认无误后用底部按钮写盘(写入原存档会先自动备份)。");
+  }
+
+  /// Applies the selected source loadout to the chosen target slot.
+  fn apply_equip_loadout_transfer(&mut self, source_index: usize) -> Result<String, String> {
+    let target_slot_text = self.equip_target_slot_text.trim().to_owned();
+    let target_index = if target_slot_text.is_empty() {
+      None
+    } else {
+      Some(target_slot_text.parse::<usize>().map_err(|_| "目标槽位必须是数字")?)
+    };
+    {
+      let Some(source) = self.source.as_ref() else {
+        return Err("尚未打开来源存档".to_owned());
+      };
+      let Some(target) = self.target.as_mut() else {
+        return Err("尚未打开目标存档".to_owned());
+      };
+      let slot = edit::copy_equip_loadout(
+        target.document.payload_mut(),
+        source.document.payload(),
+        source_index,
+        target_index,
+        self.equip_with_pieces,
+      )
+      .map_err(|error| error.to_string())?;
+      self.dirty = true;
+      let pieces = if self.equip_with_pieces { ",引用装备已同槽位搬运" } else { "" };
+      Ok(format!("装备组合已转移到槽位 {slot}{pieces}"))
+    }
+  }
+
+  /// Applies the single-piece box transfer.
+  fn apply_equip_piece_transfer(&mut self) -> Result<String, String> {
+    let source_index = self
+      .equip_piece_source_text
+      .trim()
+      .parse::<usize>()
+      .map_err(|_| "来源槽位必须是数字")?;
+    let target_index = self
+      .equip_piece_target_text
+      .trim()
+      .parse::<usize>()
+      .map_err(|_| "目标槽位必须是数字")?;
+    {
+      let Some(source) = self.source.as_ref() else {
+        return Err("尚未打开来源存档".to_owned());
+      };
+      let Some(target) = self.target.as_mut() else {
+        return Err("尚未打开目标存档".to_owned());
+      };
+      edit::copy_equip_piece(target.document.payload_mut(), source.document.payload(), source_index, target_index)
+        .map_err(|error| error.to_string())?;
+      self.dirty = true;
+      Ok(format!("装备已从来源槽位 {source_index} 转移到目标槽位 {target_index}"))
+    }
   }
 
   fn show_transfer_tab(&mut self, ui: &mut egui::Ui) {
