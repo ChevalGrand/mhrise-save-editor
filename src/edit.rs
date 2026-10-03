@@ -314,6 +314,15 @@ fn collect_classes<'a>(payload: &'a SavePayload, class_hash: u32, out: &mut Vec<
   }
 }
 
+/// Diagnostic access for examples: every instance of `class_hash`.
+pub fn collect_classes_public<'a>(
+  payload: &'a SavePayload,
+  class_hash: u32,
+  out: &mut Vec<&'a Class>,
+) {
+  collect_classes(payload, class_hash, out)
+}
+
 fn collect_in_class<'a>(class: &'a Class, class_hash: u32, out: &mut Vec<&'a Class>) {
   if class.hash == class_hash {
     out.push(class);
