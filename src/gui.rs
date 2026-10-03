@@ -343,7 +343,7 @@ impl WorkerTask {
 // ---------------------------------------------------------------------------
 
 impl eframe::App for GuiApp {
-  fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+  fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
     if let Some(receiver) = &self.receiver {
       match receiver.try_recv() {
         Ok(WorkerEvent::Opened(result, is_source)) => {
@@ -411,7 +411,7 @@ impl eframe::App for GuiApp {
       }
     }
 
-    egui::CentralPanel::default().show(ctx, |ui| {
+    egui::CentralPanel::default().show(ui, |ui| {
       self.show_top_bar(ui);
       ui.add_space(4.0);
       self.show_tab_bar(ui);
@@ -434,7 +434,7 @@ impl eframe::App for GuiApp {
     });
 
     if self.busy {
-      ctx.request_repaint_after(Duration::from_millis(120));
+      ui.ctx().request_repaint_after(Duration::from_millis(120));
     }
   }
 }
