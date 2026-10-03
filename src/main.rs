@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 use mhrise_save_editor::{
   archive::{backup_dir, restore_dir},
   container::SteamSave,
-  discover::{discover_core_files, discover_save_files},
+  discover::{self, discover_core_files, discover_save_files},
   edit,
   format::{DsssHeader, parse_header},
   json::JsonSave,
@@ -28,7 +28,13 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
   /// Show container facts for a save file or a win64_save directory.
-  Inspect { path: PathBuf },
+  Inspect {
+    path: PathBuf,
+    /// SteamID64 owning the saves; when given, core slots also report the
+    /// hunter/master/anomaly-research ranks.
+    #[arg(long)]
+    steamid64: Option<u64>,
+  },
   /// Decrypt a save and dump its class stream as JSON.
   DumpJson {
     /// A core save file, or a directory (uses its first slot).
@@ -154,7 +160,7 @@ enum Command {
 fn main() -> Result<()> {
   let cli = Cli::parse();
   match cli.command {
-    Command::Inspect { path } => inspect(&path),
+    Command::Inspect { path, steamid64 } => inspect(&path, steamid64),
     Command::DumpJson { save, steamid64, output } => dump_json(&save, steamid64, output.as_deref()),
     Command::ApplyJson { save, json, steamid64, output } => {
       apply_json(&save, &json, steamid64, output.as_deref())
@@ -179,7 +185,7 @@ fn main() -> Result<()> {
   }
 }
 
-fn inspect(path: &Path) -> Result<()> {
+fn inspect(path: &Path, steamid64: Option<u64>) -> Result<()> {
   let files = discover_save_files(path)?;
   println!("Input: {}", path.display());
   println!("Save files: {}", files.len());
@@ -194,6 +200,16 @@ fn inspect(path: &Path) -> Result<()> {
       file.checksum
     );
     print_header_details(&header, data.len());
+    if let Some(steamid64) = steamid64
+      && file.kind == discover::SaveFileKind::Core
+      && let Ok(document) = SteamSave::open_path(&file.path, steamid64)
+      && let Some(ranks) = edit::read_ranks(document.payload())
+    {
+      println!(
+        "  ranks: HR={} MR={} MysteryResearch={}",
+        ranks.hunter, ranks.master, ranks.mystery_research
+      );
+    }
   }
   Ok(())
 }

@@ -23,7 +23,8 @@ const TAB_INFO: usize = 0;
 const TAB_PLAYER: usize = 1;
 const TAB_ITEMBOX: usize = 2;
 const TAB_TRANSFER: usize = 3;
-const TAB_HELP: usize = 4;
+const TAB_BACKUP: usize = 4;
+const TAB_HELP: usize = 5;
 
 /// Loads a single-face CJK .ttf font. egui's text rasterizer (ab_glyph) does
 /// NOT support .ttc collections, which is why msyh.ttc/simsun.ttc cannot be
@@ -80,6 +81,8 @@ impl OpenedSave {
 enum WorkerEvent {
   Opened(Result<Box<OpenedSave>, String>, bool),
   Saved(Result<PathBuf, String>),
+  /// A background operation that only produces a status line (backup/restore).
+  Report(Result<String, String>),
 }
 
 // ---------------------------------------------------------------------------
@@ -100,6 +103,9 @@ pub struct GuiApp {
   money_input: String,
   points_input: String,
   total_input: String,
+  hunter_rank_input: String,
+  master_rank_input: String,
+  mystery_rank_input: String,
   box_filter: String,
   box_edits: Vec<String>,
   busy: bool,
@@ -113,6 +119,8 @@ pub struct GuiApp {
   xfer_equip_box: bool,
   xfer_equip_manager: bool,
   xfer_item_my_set: bool,
+  /// Backup awaiting a second confirming click on 还原.
+  restore_confirm: Option<PathBuf>,
 }
 
 /// (label, item-table categories) groups for the item-box transfer filter.
@@ -226,6 +234,47 @@ impl GuiApp {
       applied += 1;
     }
 
+    // Ranks: only apply when the input parses and differs; the ranges are the
+    // game's caps (HR/MR 999, anomaly research 300).
+    let rank_parse = |text: &str| -> Result<Option<u32>, String> {
+      let trimmed = text.trim();
+      if trimmed.is_empty() {
+        return Ok(None);
+      }
+      let value = trimmed.parse::<u32>().map_err(|_| format!("等级必须是数字: {text:?}"))?;
+      Ok(Some(value))
+    };
+    let hunter_rank = rank_parse(&self.hunter_rank_input)?;
+    let master_rank = rank_parse(&self.master_rank_input)?;
+    let mystery_rank = rank_parse(&self.mystery_rank_input)?;
+    for (name, value, cap) in [
+      ("猎人等级", hunter_rank, 999),
+      ("大师等级", master_rank, 999),
+      ("怪异研究等级", mystery_rank, 300),
+    ] {
+      if let Some(value) = value
+        && (value == 0 || value > cap)
+      {
+        return Err(format!("{name} 超出范围 (1-{cap}): {value}"));
+      }
+    }
+    if hunter_rank.is_some() || master_rank.is_some() || mystery_rank.is_some() {
+      let current = edit::read_ranks(opened.document.payload())
+        .ok_or_else(|| "未找到等级字段 (schema 不符)".to_owned())?;
+      let changed = |input: Option<u32>, current_value: u32| input.is_some_and(|v| v != current_value);
+      if changed(hunter_rank, current.hunter)
+        || changed(master_rank, current.master)
+        || changed(mystery_rank, current.mystery_research)
+      {
+        let hunter = hunter_rank.unwrap_or(current.hunter);
+        let master = master_rank.unwrap_or(current.master);
+        let mystery = mystery_rank.unwrap_or(current.mystery_research);
+        edit::set_ranks(opened.document.payload_mut(), hunter, master, mystery)
+          .map_err(|error| error.to_string())?;
+        applied += 1;
+      }
+    }
+
     if applied == 0 {
       return Err("没有可应用的修改 (数值未变化或输入为空)".to_owned());
     }
@@ -237,6 +286,11 @@ impl GuiApp {
     self.money_input = money.to_string();
     self.total_input = total.to_string();
     self.points_input = points.to_string();
+    if let Some(ranks) = edit::read_ranks(opened.document.payload()) {
+      self.hunter_rank_input = ranks.hunter.to_string();
+      self.master_rank_input = ranks.master.to_string();
+      self.mystery_rank_input = ranks.mystery_research.to_string();
+    }
     self.dirty = true;
     Ok(())
   }
@@ -391,6 +445,8 @@ impl GuiApp {
 enum WorkerTask {
   Open { path: PathBuf, steamid64: u64, is_source: bool },
   Save { document: Box<OpenedSave>, output: PathBuf },
+  Backup { dir: PathBuf },
+  Restore { backup: PathBuf, target_dir: PathBuf },
 }
 
 impl WorkerTask {
@@ -404,6 +460,10 @@ impl WorkerTask {
         }
       }
       WorkerTask::Save { output, .. } => format!("保存到: {}", output.display()),
+      WorkerTask::Backup { dir } => format!("备份目录: {}", dir.display()),
+      WorkerTask::Restore { backup, target_dir } => {
+        format!("还原 {} 到 {}", backup.display(), target_dir.display())
+      }
     }
   }
 
@@ -418,6 +478,32 @@ impl WorkerTask {
         let result =
           document.document.write_to(&output).map(|_| output).map_err(|error| format!("{error:?}"));
         WorkerEvent::Saved(result)
+      }
+      WorkerTask::Backup { dir } => {
+        let result = crate::archive::backup_dir(&dir, None)
+          .map(|report| {
+            format!(
+              "已备份 {} 个文件 ({} 字节) 到 {},每份拷贝已逐字节校验",
+              report.files.len(),
+              report.total_bytes(),
+              report.destination.display()
+            )
+          })
+          .map_err(|error| format!("{error:?}"));
+        WorkerEvent::Report(result)
+      }
+      WorkerTask::Restore { backup, target_dir } => {
+        let result = crate::archive::restore_dir(&backup, &target_dir, true)
+          .map(|report| {
+            format!(
+              "已还原 {} 个文件 ({} 字节) 到 {},请重新打开存档查看",
+              report.files.len(),
+              report.total_bytes(),
+              target_dir.display()
+            )
+          })
+          .map_err(|error| format!("{error:?}"));
+        WorkerEvent::Report(result)
       }
     }
   }
@@ -491,6 +577,11 @@ impl eframe::App for GuiApp {
               self.money_input = money.to_string();
               self.total_input = total.to_string();
               self.points_input = points.to_string();
+              let ranks = edit::read_ranks(opened.document.payload());
+              self.hunter_rank_input = ranks.map(|r| r.hunter.to_string()).unwrap_or_default();
+              self.master_rank_input = ranks.map(|r| r.master.to_string()).unwrap_or_default();
+              self.mystery_rank_input =
+                ranks.map(|r| r.mystery_research.to_string()).unwrap_or_default();
               self.box_edits = vec![String::new(); opened.box_items.len()];
               self.log_line(&format!(
                 "✔ 已打开{}: {} ({})",
@@ -520,6 +611,25 @@ impl eframe::App for GuiApp {
             Err(error) => self.log_line(&format!("✘ 保存失败: {error}")),
           }
         }
+        Ok(WorkerEvent::Report(result)) => {
+          self.busy = false;
+          self.receiver = None;
+          self.restore_confirm = None;
+          let restored_ok = result.is_ok();
+          match result {
+            Ok(text) => self.log_line(&format!("✔ {text}")),
+            Err(error) => self.log_line(&format!("✘ {error}")),
+          }
+          // A restore rewrote the save directory under us; reload the target
+          // so the editor shows what is actually on disk now.
+          if restored_ok
+            && let (Ok(steamid64), Some(opened)) = (self.parsed_steamid64(), self.target.as_ref())
+          {
+            let task =
+              WorkerTask::Open { path: opened.path.clone(), steamid64, is_source: false };
+            self.spawn(ui.ctx(), task);
+          }
+        }
         Err(TryRecvError::Empty) => {}
         Err(TryRecvError::Disconnected) => {
           self.busy = false;
@@ -545,6 +655,7 @@ impl eframe::App for GuiApp {
           TAB_PLAYER => self.show_player_tab(ui),
           TAB_ITEMBOX => self.show_itembox_tab(ui),
           TAB_TRANSFER => self.show_transfer_tab(ui),
+          TAB_BACKUP => self.show_backup_tab(ui),
           _ => self.show_help_tab(ui),
         }
       });
@@ -676,6 +787,7 @@ impl GuiApp {
         (TAB_PLAYER, "玩家数据"),
         (TAB_ITEMBOX, "道具箱编辑"),
         (TAB_TRANSFER, "存档转移"),
+        (TAB_BACKUP, "备份还原"),
         (TAB_HELP, "帮助"),
       ] {
         ui.selectable_value(&mut self.tab, tab, label);
@@ -715,6 +827,13 @@ impl GuiApp {
       let points = edit::read_points(opened.document.payload()).unwrap_or(0);
       ui.label(format!("{money} / {points} (累计获得 {total})"));
       ui.end_row();
+      ui.label("等级 (HR/MR/怪异研究)");
+      let ranks = edit::read_ranks(opened.document.payload());
+      ui.label(match ranks {
+        Some(ranks) => format!("{} / {} / {}", ranks.hunter, ranks.master, ranks.mystery_research),
+        None => "(未找到)".to_owned(),
+      });
+      ui.end_row();
       ui.label("文件");
       ui.label(opened.path.display().to_string());
       ui.end_row();
@@ -749,6 +868,15 @@ impl GuiApp {
       ui.end_row();
       ui.label("点数");
       ui.add_sized([200.0, 20.0], egui::TextEdit::singleline(&mut self.points_input));
+      ui.end_row();
+      ui.label("猎人等级 (HR)");
+      ui.add_sized([200.0, 20.0], egui::TextEdit::singleline(&mut self.hunter_rank_input));
+      ui.end_row();
+      ui.label("大师等级 (MR)");
+      ui.add_sized([200.0, 20.0], egui::TextEdit::singleline(&mut self.master_rank_input));
+      ui.end_row();
+      ui.label("怪异研究等级");
+      ui.add_sized([200.0, 20.0], egui::TextEdit::singleline(&mut self.mystery_rank_input));
       ui.end_row();
     });
     ui.add_space(4.0);
@@ -969,6 +1097,62 @@ impl GuiApp {
     ui.label("转移在内存中立即生效;确认无误后用下方“保存为新文件”写盘。");
   }
 
+  fn show_backup_tab(&mut self, ui: &mut egui::Ui) {
+    let Some(target_dir) = self.target.as_ref().map(|opened| opened.path.parent().map(Path::to_path_buf)).flatten() else {
+      ui.label("先用顶部“快速选择”或“浏览…”打开一个存档,才能定位其存档目录。");
+      return;
+    };
+    ui.label(format!("当前存档目录: {}", target_dir.display()));
+    ui.label(
+      "备份把整个存档目录原样复制到 文档\\MHR-Save-Backups\\<账号>\\<时间戳>,逐字节校验,且位于 Steam 云同步范围之外;",
+    );
+    ui.label("还原则把所选备份覆盖回存档目录——覆盖前请关闭游戏,并且不要与 Steam 云同步同时进行。");
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+      if ui.add_enabled(!self.busy, egui::Button::new("备份整个存档目录")).clicked() {
+        self.spawn(ui.ctx(), WorkerTask::Backup { dir: target_dir.clone() });
+      }
+      ui.label(format!(
+        "已有备份 {} 份",
+        backups_for_target(&target_dir).map(|list| list.len()).unwrap_or(0)
+      ));
+    });
+
+    ui.add_space(6.0);
+    ui.separator();
+    ui.heading("已有备份 (新在前)");
+    let backups = backups_for_target(&target_dir).unwrap_or_default();
+    if backups.is_empty() {
+      ui.label("(尚无备份;强烈建议在第一次编辑前备份一次)");
+      return;
+    }
+    egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
+      for backup in &backups {
+        ui.horizontal(|ui| {
+          ui.label(backup.file_name().and_then(|name| name.to_str()).unwrap_or("?").to_owned());
+          let armed = self.restore_confirm.as_deref() == Some(backup.as_path());
+          let label = if armed { "⚠ 再次点击确认还原" } else { "还原此备份" };
+          if ui.add_enabled(!self.busy, egui::Button::new(label)).clicked() {
+            if armed {
+              self.restore_confirm = None;
+              self.log_line(&format!("▶ 正在还原 {} …", backup.display()));
+              self.spawn(ui.ctx(), WorkerTask::Restore {
+                backup: backup.clone(),
+                target_dir: target_dir.clone(),
+              });
+            } else {
+              self.restore_confirm = Some(backup.clone());
+              self.log_line("⚠ 还原会覆盖存档目录中的全部文件;再点一次“还原此备份”确认");
+            }
+          }
+          if armed && ui.small_button("取消").clicked() {
+            self.restore_confirm = None;
+          }
+        });
+      }
+    });
+  }
+
   fn show_help_tab(&mut self, ui: &mut egui::Ui) {
     ui.label(r"存档目录: <Steam库>\userdata\<32位账号ID>\1446780\remote\win64_save");
     ui.label(r"· Steam 默认装在 C:\Program Files (x86)\Steam;自定义库在其它盘(例如 D:\Steam)。启动时已自动扫描所有 Steam 库。");
@@ -1040,6 +1224,24 @@ impl GuiApp {
 // ---------------------------------------------------------------------------
 // Steam save discovery
 // ---------------------------------------------------------------------------
+
+/// The backup folders recorded for the target's account, newest first.
+/// Mirrors the layout `archive::documents_backup_destination` writes:
+/// `Documents\MHR-Save-Backups\<account>\<timestamp>`.
+fn backups_for_target(target_save: &Path) -> Option<Vec<PathBuf>> {
+  let account = target_save.parent()?.parent()?.parent()?.file_name()?.to_str()?;
+  let home = std::env::var_os("USERPROFILE")?;
+  let root = PathBuf::from(home).join("Documents").join("MHR-Save-Backups").join(account);
+  let mut backups: Vec<PathBuf> = fs::read_dir(&root)
+    .ok()?
+    .filter_map(|entry| entry.ok())
+    .map(|entry| entry.path())
+    .filter(|path| path.is_dir())
+    .collect();
+  backups.sort();
+  backups.reverse();
+  Some(backups)
+}
 
 fn path_key(path: &Path) -> String {
   let text = path.to_string_lossy().replace('/', "\\");

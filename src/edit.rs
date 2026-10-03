@@ -42,6 +42,109 @@ pub const ITEM_MY_SET_CLASS: u32 = 0x8923_cd68;
 pub const EQUIP_ID_VAL: u32 = 0x6e86_4182;
 /// `snow.data.EquipBox._WeaponArmorInventoryList`
 pub const EQUIP_BOX_WEAPON_ARMOR_LIST: u32 = 0xa097_349e;
+/// `snow.progress.ProgressSaveData` — the authoritative rank progression.
+pub const PROGRESS_SAVE_CLASS: u32 = 0x948b_7b9d;
+/// `snow.data.GuildCardData` — the self card carries display copies of the
+/// ranks; buddy cards live in an array and must never be touched.
+pub const GUILD_CARD_CLASS: u32 = 0x4454_1321;
+/// `ProgressSaveData._HunterRank` / `GuildCardData.HunterRank`.
+pub const HUNTER_RANK: u32 = 0x5653_c091;
+/// `ProgressSaveData._HunterRankPoint` (accumulation only; never rewritten).
+pub const HUNTER_RANK_POINT: u32 = 0x8789_d225;
+/// `ProgressSaveData._MasterRank` / `GuildCardData._MasterRank`.
+pub const MASTER_RANK: u32 = 0x4e42_8685;
+/// `ProgressSaveData._MasterRankPoint`.
+pub const MASTER_RANK_POINT: u32 = 0xdf24_c36f;
+/// `ProgressSaveData._MysteryResearchLevel` — the 怪异研究等级.
+pub const MYSTERY_RESEARCH_LEVEL: u32 = 0x6d6b_56e7;
+/// `ProgressSaveData._MysteryResearchPoint`.
+pub const MYSTERY_RESEARCH_POINT: u32 = 0x71a2_e552;
+/// `GuildCardData.LaboLv` — the self card's copy of the 怪异研究等级.
+pub const GUILD_CARD_LABO_LV: u32 = 0x665f_00e3;
+
+/// The three progression ranks, from `ProgressSaveData`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ranks {
+  pub hunter: u32,
+  pub master: u32,
+  pub mystery_research: u32,
+}
+
+/// Reads the three ranks from `ProgressSaveData` (the authoritative copy).
+pub fn read_ranks(payload: &SavePayload) -> Option<Ranks> {
+  let mut instances = Vec::new();
+  collect_classes(payload, PROGRESS_SAVE_CLASS, &mut instances);
+  if instances.len() != 1 {
+    return None;
+  }
+  let read = |field_hash: u32| -> Option<u32> {
+    instances[0]
+      .fields
+      .iter()
+      .find(|field| field.hash == field_hash)
+      .and_then(|field| match &field.value {
+        FieldValue::Scalar { bytes, size: 4 } if bytes.len() == 4 => {
+          Some(u32::from_le_bytes(bytes.as_slice().try_into().expect("4 bytes")))
+        }
+        _ => None,
+      })
+  };
+  Some(Ranks {
+    hunter: read(HUNTER_RANK)?,
+    master: read(MASTER_RANK)?,
+    mystery_research: read(MYSTERY_RESEARCH_LEVEL)?,
+  })
+}
+
+/// Sets the three ranks. Writes both the authoritative `ProgressSaveData`
+/// values and the self guild card's display copies so the title screen and
+/// the progression system agree. Buddy guild cards (nested in arrays) are
+/// never touched, and the point accumulators are left alone.
+pub fn set_ranks(
+  payload: &mut SavePayload,
+  hunter: u32,
+  master: u32,
+  mystery_research: u32,
+) -> Result<Ranks> {
+  let before = read_ranks(payload)
+    .ok_or_else(|| anyhow::anyhow!("ProgressSaveData not found or ambiguous; refusing to write ranks"))?;
+  set_scalar(payload, PROGRESS_SAVE_CLASS, HUNTER_RANK, hunter, "_HunterRank")?;
+  set_scalar(payload, PROGRESS_SAVE_CLASS, MASTER_RANK, master, "_MasterRank")?;
+  set_scalar(payload, PROGRESS_SAVE_CLASS, MYSTERY_RESEARCH_LEVEL, mystery_research, "_MysteryResearchLevel")?;
+
+  let updates = [
+    (HUNTER_RANK, hunter),
+    (MASTER_RANK, master),
+    (GUILD_CARD_LABO_LV, mystery_research),
+  ];
+  fn update(class: &mut Class, updates: &[(u32, u32)], updated: &mut usize) {
+    if class.hash == GUILD_CARD_CLASS {
+      for field in &mut class.fields {
+        if let Some(&(_, value)) = updates.iter().find(|(hash, _)| *hash == field.hash)
+          && let FieldValue::Scalar { size: 4, bytes } = &mut field.value
+          && bytes.len() == 4
+        {
+          *bytes = value.to_le_bytes().to_vec();
+          *updated += 1;
+        }
+      }
+    }
+    // Class fields only: buddy guild cards live inside arrays.
+    for field in &mut class.fields {
+      if let FieldValue::Class(nested) = &mut field.value {
+        update(nested, updates, updated);
+      }
+    }
+  }
+  let mut updated = 0usize;
+  for entry in &mut payload.entries {
+    update(&mut entry.class, &updates, &mut updated);
+  }
+  if updated == 0 {
+    bail!("self guild card not found; refusing to write ranks");
+  }
+  Ok(before)
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct EquipmentTransferReport {
@@ -1005,6 +1108,111 @@ mod tests {
       .expect_err("slot count mismatch must fail");
     assert!(
       error.to_string().contains("2 slots but target has 1"),
+      "unexpected error: {error}"
+    );
+  }
+
+  fn ranks_payload(hunter: u32, master: u32, mystery: u32) -> SavePayload {
+    let progress = Class {
+      hash: PROGRESS_SAVE_CLASS,
+      fields: vec![
+        Field { hash: HUNTER_RANK, field_type: 0x08, value: scalar(hunter) },
+        Field { hash: MASTER_RANK, field_type: 0x08, value: scalar(master) },
+        Field { hash: MYSTERY_RESEARCH_LEVEL, field_type: 0x08, value: scalar(mystery) },
+      ],
+    };
+    let guild_card = Class {
+      hash: GUILD_CARD_CLASS,
+      fields: vec![
+        Field { hash: HUNTER_RANK, field_type: 0x08, value: scalar(hunter) },
+        Field { hash: MASTER_RANK, field_type: 0x08, value: scalar(master) },
+        Field { hash: GUILD_CARD_LABO_LV, field_type: 0x08, value: scalar(mystery) },
+      ],
+    };
+    let buddy_card = Class {
+      hash: GUILD_CARD_CLASS,
+      fields: vec![Field { hash: HUNTER_RANK, field_type: 0x08, value: scalar(43) }],
+    };
+    use crate::payload::Array;
+    let buddies = Array {
+      member_type: 0x11,
+      member_size: 0,
+      array_type: 1,
+      class_hashes: Some(vec![GUILD_CARD_CLASS]),
+      values: vec![crate::payload::ArrayValue::Class(Box::new(buddy_card))],
+    };
+    SavePayload {
+      entries: vec![
+        crate::payload::NativeClass {
+          native_hash: 0x1,
+          class: Class {
+            hash: 0x2,
+            fields: vec![Field {
+              hash: 0x3,
+              field_type: 0x11,
+              value: FieldValue::Class(Box::new(progress)),
+            }],
+          },
+        },
+        crate::payload::NativeClass {
+          native_hash: 0x4,
+          class: Class {
+            hash: 0x5,
+            fields: vec![
+              Field {
+                hash: 0x6,
+                field_type: 0x11,
+                value: FieldValue::Class(Box::new(guild_card)),
+              },
+              Field { hash: 0x7, field_type: -1, value: FieldValue::Array(buddies) },
+            ],
+          },
+        },
+      ],
+    }
+  }
+
+  #[test]
+  fn reads_and_sets_ranks_in_both_copies_but_not_buddy_cards() {
+    let mut payload = ranks_payload(3, 3, 1);
+
+    let before = read_ranks(&payload).expect("read ranks");
+    assert_eq!(before, Ranks { hunter: 3, master: 3, mystery_research: 1 });
+
+    let previous = set_ranks(&mut payload, 999, 999, 300).expect("set ranks");
+    assert_eq!(previous, Ranks { hunter: 3, master: 3, mystery_research: 1 });
+
+    assert_eq!(read_ranks(&payload), Some(Ranks { hunter: 999, master: 999, mystery_research: 300 }));
+
+    // The self guild card copy is updated alongside.
+    let mut cards = Vec::new();
+    collect_classes(&payload, GUILD_CARD_CLASS, &mut cards);
+    assert_eq!(cards.len(), 2, "self card + one buddy card");
+    let card_value = |class: &Class, hash: u32| -> u32 {
+      let FieldValue::Scalar { bytes, .. } = &class
+        .fields
+        .iter()
+        .find(|field| field.hash == hash)
+        .expect("field")
+        .value
+      else {
+        panic!("scalar");
+      };
+      u32::from_le_bytes(bytes.as_slice().try_into().expect("4 bytes"))
+    };
+    assert_eq!(card_value(cards[0], HUNTER_RANK), 999);
+    assert_eq!(card_value(cards[0], GUILD_CARD_LABO_LV), 300);
+    // The buddy card (nested in an array) is untouched.
+    assert_eq!(card_value(cards[1], HUNTER_RANK), 43);
+  }
+
+  #[test]
+  fn set_ranks_requires_a_guild_card() {
+    let mut payload = SavePayload { entries: vec![] };
+    let error =
+      set_ranks(&mut payload, 99, 99, 9).expect_err("missing progression must fail");
+    assert!(
+      error.to_string().contains("refusing to write ranks"),
       "unexpected error: {error}"
     );
   }
