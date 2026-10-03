@@ -11,3 +11,8 @@ proxy = ""
 
 [net]
 git-fetch-with-cli = true
+
+# Statically link the VC++ runtime so the release exes run on machines
+# without the Visual C++ Redistributable installed.
+[build]
+rustflags = ["-C", "target-feature=+crt-static"]
