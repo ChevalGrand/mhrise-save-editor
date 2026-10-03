@@ -13,6 +13,10 @@ cargo run --release --bin mhrise-save-editor-gui
 
 Pick a target save, optionally a source save (for transfers), enter your SteamID64, and use the buttons to read save info, set wallet/points, transfer the item box, or transfer the whole equipment complex (equipment box + talismans + loadout registers + worn pack). Every operation runs in the background and writes a NEW file (`<name>.edited.bin` / `<name>.transferred.bin`) next to the chosen save; swap it in with the game closed.
 
+### Chinese input not working (no candidates, keystrokes swallowed)?
+
+Known winit (windowing library) incompatibility with TSF-mode IMEs — it affects every winit-based app, not this tool's save logic. Fix for Microsoft Pinyin: Windows Settings → Time & language → Language & region → Chinese → Microsoft Pinyin → General → Compatibility → turn on **"Use previous version of Microsoft input method"** (使用以前版本的 Microsoft 输入法). Third-party IMEs (Sogou etc.) may show the same problem; switch to compatibility-mode Microsoft Pinyin when editing. Set `MHR_IME_DEBUG=1` to log every keyboard/IME event egui receives into `ime_debug.log` next to the working directory when reporting issues.
+
 ## Attribution
 
 The DSSS container, Citrus, and RE Engine class-stream handling in `src/crypto/`, `src/format.rs`, `src/payload.rs`, and `src/discover.rs` is ported verbatim from the MIT-licensed [jinghaihan/mhrise-save-converter](https://github.com/jinghaihan/mhrise-save-converter), whose format research builds on [kvasszn/ree-save-editor](https://github.com/kvasszn/ree-save-editor). Everything else in this repository is original to this project.

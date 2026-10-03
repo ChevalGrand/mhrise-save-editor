@@ -9,6 +9,7 @@ use std::{
   fs,
   path::{Path, PathBuf},
   sync::mpsc::{self, Receiver, TryRecvError},
+  sync::OnceLock,
   thread,
   time::Duration,
 };
@@ -342,8 +343,41 @@ impl WorkerTask {
 // eframe app
 // ---------------------------------------------------------------------------
 
+impl GuiApp {
+  /// Diagnostics for IME debugging: with `MHR_IME_DEBUG=1`, appends every
+  /// keyboard/IME input event egui receives to `ime_debug.log` next to the
+  /// executable. Cheap when the variable is unset.
+  fn log_input_events_if_enabled(&mut self, ui: &egui::Ui) {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("MHR_IME_DEBUG").is_some()) {
+      return;
+    }
+    let events = ui.input(|input| input.events.clone());
+    if events.is_empty() {
+      return;
+    }
+    let Ok(mut file) = std::fs::OpenOptions::new()
+      .create(true)
+      .append(true)
+      .open("ime_debug.log")
+    else {
+      return;
+    };
+    use std::io::Write as _;
+    let stamp = std::time::SystemTime::now()
+      .duration_since(std::time::UNIX_EPOCH)
+      .map(|d| d.as_millis())
+      .unwrap_or(0);
+    let _ = writeln!(file, "=== frame {stamp} ({} events)", events.len());
+    for event in events {
+      let _ = writeln!(file, "  {event:?}");
+    }
+  }
+}
+
 impl eframe::App for GuiApp {
   fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    self.log_input_events_if_enabled(ui);
     if let Some(receiver) = &self.receiver {
       match receiver.try_recv() {
         Ok(WorkerEvent::Opened(result, is_source)) => {
@@ -432,6 +466,21 @@ impl eframe::App for GuiApp {
         ui.monospace(if self.log.is_empty() { "(就绪)" } else { &self.log });
       });
     });
+
+    // Keep the window's IME context associated at all times. winit dissociates
+    // it at window creation, and egui disassociates it again whenever no
+    // TextEdit has focus (Windows: ImmAssociateContextEx IACE_CHILDREN); on
+    // some Windows builds the IME then never composes again — keys are
+    // swallowed with no preedit or candidate window until a refocus. eframe
+    // runs the viewport commands after egui's own IME handling, so re-allowing
+    // IME on the frames where egui turned it off wins the race. Frames where a
+    // TextEdit is focused (composition in progress) are left untouched. The
+    // cost is that a stray composition can start while no text field is
+    // focused; harmless here because nothing else consumes plain typing.
+    let ime_allowed_by_text_edit = ui.ctx().output(|output| output.ime.is_some());
+    if !ime_allowed_by_text_edit {
+      ui.ctx().send_viewport_cmd(egui::ViewportCommand::IMEAllowed(true));
+    }
 
     if self.busy {
       ui.ctx().request_repaint_after(Duration::from_millis(120));
@@ -757,6 +806,11 @@ impl GuiApp {
     );
     ui.label("· Steam 云同步: 编辑时建议让 Steam 离线,避免云端旧档覆盖");
     ui.label("· 角色存档必须由游戏创建过(空槽没有引导存档时,游戏不会识别放入的文件)");
+    ui.add_space(8.0);
+    ui.heading("中文无法输入/没有候选词?");
+    ui.label("· 本程序基于 winit 窗口库,与 TSF 模式的输入法存在已知兼容性问题(打字被吞、无候选词)");
+    ui.label("· 微软拼音: 设置 → 时间和语言 → 语言和区域 → 中文 → 微软拼音 → 常规 → 兼容性 → 打开「使用以前版本的 Microsoft 输入法」");
+    ui.label("· 搜狗等第三方输入法: 若同样无效,属于同一兼容性问题,可临时切换到已开启兼容模式的微软拼音;此问题影响所有 winit 应用,与本工具的存档逻辑无关");
   }
 
   fn show_save_bar(&mut self, ui: &mut egui::Ui) {
